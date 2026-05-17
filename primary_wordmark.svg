@@ -1,0 +1,13 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 800 220" role="img">
+  <title>Henry &amp; Henry — Primary Wordmark</title>
+  <desc>HENRY &amp; HENRY in tracked serif with gold rule and tagline INVESTIGATIVE INTELLIGENCE</desc>
+  <text x="400" y="100" text-anchor="middle"
+        font-family="'Times New Roman', Garamond, Georgia, serif"
+        font-size="52" font-weight="500" letter-spacing="6"
+        fill="#1A2238">HENRY <tspan fill="#8B6914" font-style="italic" font-weight="400">&amp;</tspan> HENRY</text>
+  <line x1="220" y1="135" x2="580" y2="135" stroke="#8B6914" stroke-width="0.8"/>
+  <text x="400" y="172" text-anchor="middle"
+        font-family="'Times New Roman', Garamond, Georgia, serif"
+        font-size="14" font-weight="400" letter-spacing="8"
+        fill="#1A2238">INVESTIGATIVE INTELLIGENCE</text>
+</svg>

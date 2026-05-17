@@ -1,0 +1,6 @@
+.claude/
+graphify-out/
+*.key
+*.txt
+.env
+.env.*
