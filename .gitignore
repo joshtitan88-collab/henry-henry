@@ -3,5 +3,6 @@ graphify-out/
 *.key
 *.txt
 !requirements.txt
+*.db
 .env
 .env.*
