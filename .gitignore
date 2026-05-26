@@ -2,5 +2,6 @@
 graphify-out/
 *.key
 *.txt
+!requirements.txt
 .env
 .env.*
