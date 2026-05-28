@@ -294,6 +294,19 @@ users_t = Table(
     Column("current_period_end", DateTime(timezone=True)),
 )
 
+# Single-use, time-limited password-reset tokens. Stored hashed so a database
+# leak never exposes a usable token. A separate table (not extra columns on
+# users) so metadata.create_all adds it cleanly to existing databases.
+password_resets_t = Table(
+    "password_resets", metadata,
+    Column("id", Integer, primary_key=True, autoincrement=True),
+    Column("user_id", Integer),
+    Column("token_hash", String(64)),
+    Column("created_at", DateTime(timezone=True)),
+    Column("expires_at", DateTime(timezone=True)),
+    Column("used", Boolean, default=False),
+)
+
 # Saved searches that monitor.py re-runs on a schedule, alerting on change.
 monitors_t = Table(
     "monitors", metadata,
@@ -625,6 +638,84 @@ def downgrade_user(engine, user_id):
 
 
 # ---------------------------------------------------------------------------
+# Password reset (single-use, time-limited tokens; needs SMTP to deliver)
+# ---------------------------------------------------------------------------
+RESET_TTL_MIN = 60
+
+
+def _token_hash(token):
+    return hashlib.sha256(token.encode()).hexdigest()
+
+
+def _as_utc(dt):
+    """SQLite hands back naive datetimes; treat them as UTC for comparison."""
+    if dt is not None and dt.tzinfo is None:
+        return dt.replace(tzinfo=datetime.timezone.utc)
+    return dt
+
+
+def create_password_reset(engine, email):
+    """Issue a single-use reset token for the user, invalidating any prior
+    outstanding tokens. Returns the raw token, or None if no such user. The
+    caller MUST NOT reveal which case occurred (avoids account enumeration)."""
+    user = get_user_by_email(engine, email)
+    if not user:
+        return None
+    token = secrets.token_urlsafe(32)
+    now = datetime.datetime.now(datetime.timezone.utc)
+    with engine.begin() as conn:
+        conn.execute(password_resets_t.update().where(
+            password_resets_t.c.user_id == user["id"],
+            password_resets_t.c.used == False,  # noqa: E712
+        ).values(used=True))
+        conn.execute(password_resets_t.insert().values(
+            user_id=user["id"], token_hash=_token_hash(token), created_at=now,
+            expires_at=now + datetime.timedelta(minutes=RESET_TTL_MIN), used=False,
+        ))
+    return token
+
+
+def consume_password_reset(engine, token, new_password):
+    """Validate a reset token and set the new password. Returns (ok, error)."""
+    if len(new_password) < 8:
+        return False, "Password must be at least 8 characters."
+    now = datetime.datetime.now(datetime.timezone.utc)
+    with engine.begin() as conn:
+        row = conn.execute(select(password_resets_t).where(
+            password_resets_t.c.token_hash == _token_hash(token)
+        )).mappings().first()
+        if not row or row["used"]:
+            return False, "This reset link is invalid or has already been used."
+        if _as_utc(row["expires_at"]) and now > _as_utc(row["expires_at"]):
+            return False, "This reset link has expired. Request a new one."
+        salt, pw_hash = _hash_password(new_password)
+        conn.execute(users_t.update().where(users_t.c.id == row["user_id"]).values(
+            pw_salt=salt, pw_hash=pw_hash))
+        conn.execute(password_resets_t.update().where(
+            password_resets_t.c.id == row["id"]).values(used=True))
+    return True, None
+
+
+def request_password_reset(engine, email):
+    """Create a reset token and email the link. Returns True only if an email
+    was actually sent; the UI shows the same neutral message regardless."""
+    email = (email or "").strip().lower()
+    if not EMAIL_RE.match(email):
+        return False
+    token = create_password_reset(engine, email)
+    if not token:
+        return False
+    link = app_base_url() + "/?reset=" + token
+    body = (
+        "We received a request to reset your H&H Investigation password.\n\n"
+        f"Reset it here (this link expires in {RESET_TTL_MIN} minutes):\n{link}\n\n"
+        "If you didn't request this, ignore this email — your password will not "
+        "change.\n\n— H&H Investigation"
+    )
+    return send_email(email, "H&H Investigation — password reset", body)
+
+
+# ---------------------------------------------------------------------------
 # Stripe (raw REST via requests; dormant unless STRIPE_SECRET_KEY is set)
 # ---------------------------------------------------------------------------
 STRIPE_API = "https://api.stripe.com/v1"
@@ -942,6 +1033,18 @@ def require_login(engine):
                 else:
                     st.error("Invalid email or password.")
 
+        with st.expander("Forgot your password?"):
+            if not get_config("SMTP_HOST"):
+                st.caption("Password reset by email isn't enabled yet. Email "
+                           "joshua@hhinvestigations.com to reset your password.")
+            else:
+                with st.form("reset_request_form"):
+                    r_email = st.text_input("Account email", key="reset_req_email")
+                    if st.form_submit_button("Email me a reset link"):
+                        request_password_reset(engine, r_email)
+                        st.success("If an account exists for that email, a reset "
+                                   "link is on its way. Check your inbox and spam.")
+
     with tab_signup:
         with st.form("signup_form"):
             email2 = st.text_input("Email", key="signup_email")
@@ -976,6 +1079,35 @@ def handle_stripe_return(engine):
     st.session_state["_checkout_msg"] = msg
     st.session_state.nav = "Account"
     st.query_params.clear()
+
+
+def page_reset_password(engine, token):
+    """Set-a-new-password screen reached via an emailed ?reset=<token> link."""
+    st.markdown('<div class="section-label">Account</div>', unsafe_allow_html=True)
+    st.markdown('<div class="section-title">Reset <em>Password</em></div>', unsafe_allow_html=True)
+
+    if st.session_state.get("_reset_done"):
+        st.success("Your password has been reset. You can now log in.")
+        if st.button("Go to login", type="primary"):
+            st.session_state.pop("_reset_done", None)
+            st.session_state.nav = "Account"
+            st.query_params.clear()
+            st.rerun()
+        return
+
+    with st.form("reset_set_form"):
+        pw1 = st.text_input("New password (8+ characters)", type="password")
+        pw2 = st.text_input("Confirm new password", type="password")
+        if st.form_submit_button("Set new password", type="primary"):
+            if pw1 != pw2:
+                st.error("Passwords don't match.")
+            else:
+                ok, err = consume_password_reset(engine, token, pw1)
+                if ok:
+                    st.session_state["_reset_done"] = True
+                    st.rerun()
+                else:
+                    st.error(err)
 
 
 # ---------------------------------------------------------------------------
@@ -1771,6 +1903,13 @@ def page_search():
 # ---------------------------------------------------------------------------
 engine = get_engine()
 handle_stripe_return(engine)
+
+_reset_token = st.query_params.get("reset")
+if _reset_token:
+    render_brand_bar()
+    page_reset_password(engine, _reset_token)
+    render_footer()
+    st.stop()
 
 st.sidebar.markdown(
     """
