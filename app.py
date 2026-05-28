@@ -74,23 +74,29 @@ def allowed_depths(plan):
     keys = list(DEPTHS.keys())
     return keys[: PLAN_RANK.get(plan, 0) + 1]
 
-# Public-facing plan cards (Home). Prices are placeholders — set your own.
+# Public-facing plan cards (Home). Tuple: name, tag, price, benefit headline,
+# feature lines, featured?, badge. The middle tier carries the badge — buyers
+# gravitate toward the recommended middle option (compromise effect), and the
+# benefit line leads with the outcome, not the feature list.
 PLANS = [
-    ("Recon", "Surface web", "Free", [
+    ("Recon", "Surface web", "Free",
+     "See anyone's public footprint in seconds — no card required.", [
         "Social-handle footprint across 12 sites",
         "GitHub · Reddit · Hacker News · Gravatar",
         "Email deliverability + domain WHOIS / DNS / Wayback",
-    ], False),
-    ("Pro", "Public records & infrastructure", "$34.99 / mo", [
+    ], False, None),
+    ("Pro", "Public records & infrastructure", "$34.99 / mo",
+     "Go past the surface: court records, business ties, and live infrastructure.", [
         "Everything in Recon, plus:",
         "Court records (CourtListener) · company officers",
         "Subdomains (crt.sh) · phone intel · host & port intel (Shodan)",
-    ], True),
-    ("Deep", "Breach & dark-web exposure", "$59.99 / mo", [
+    ], True, "Recommended"),
+    ("Deep", "Breach & dark-web exposure", "$59.99 / mo",
+     "Know what's already leaked — full breach & dark-web exposure.", [
         "Everything in Pro, plus:",
         "Breach / dark-web exposure lookup (HaveIBeenPwned)",
         "Scheduled monitoring with change alerts",
-    ], False),
+    ], False, None),
 ]
 
 STATUS_ORDER = ["Submitted", "Engagement Sent", "In Progress", "Delivered"]
@@ -878,6 +884,13 @@ st.markdown(
     .tier-price { font-family: var(--display); font-size: 28px; font-weight: 700; color: var(--gold); margin-bottom: 8px; }
     .tier-scope { font-size: 14px; color: var(--text-2); font-style: italic; line-height: 1.6; }
     .tier-turn { font-family: var(--mono); font-size: 11px; color: var(--text-dim); margin-top: 10px; }
+    .tier-badge { display: inline-block; font-family: var(--mono); font-size: 9px; letter-spacing: 1.5px; text-transform: uppercase; color: var(--bg); background: var(--gold); padding: 2px 9px; border-radius: 2px; margin-bottom: 12px; font-weight: 500; }
+    .tier-benefit { font-family: var(--body); font-size: 13px; color: var(--text); line-height: 1.55; margin-bottom: 14px; padding-bottom: 12px; border-bottom: 1px solid var(--border); }
+
+    .upgrade-card { background: var(--bg-2); border: 1px solid var(--border-2); border-left: 3px solid var(--gold); padding: 18px 22px; margin: 22px 0 12px; }
+    .uc-label { font-family: var(--mono); font-size: 9px; letter-spacing: 2px; text-transform: uppercase; color: var(--gold-dim); margin-bottom: 7px; }
+    .uc-title { font-family: var(--display); font-size: 19px; font-weight: 700; color: var(--text); line-height: 1.3; margin-bottom: 6px; }
+    .uc-meta { font-family: var(--mono); font-size: 11px; color: var(--text-dim); letter-spacing: 0.5px; }
 
     .status-badge { display: inline-block; padding: 3px 10px; border-radius: 3px; font-family: var(--mono); font-size: 10px; letter-spacing: 1.5px; text-transform: uppercase; color: #fff; }
 
@@ -1153,18 +1166,20 @@ def page_home():
     st.markdown('<div class="section-label">Plans</div>', unsafe_allow_html=True)
     st.markdown('<div class="section-title">The Deeper You Go, <em>The More You See</em></div>', unsafe_allow_html=True)
     html_out = '<div class="tier-grid">'
-    for name, tag, price, features, featured in PLANS:
+    for name, tag, price, benefit, features, featured, badge in PLANS:
         cls = "tier-card featured" if featured else "tier-card"
+        badge_html = f'<div class="tier-badge">{esc(badge)}</div>' if badge else ''
         feats = "".join(f'<div class="tier-scope">• {esc(f)}</div>' for f in features)
         html_out += (
-            f'<div class="{cls}"><div class="tier-name">{esc(name)}</div>'
+            f'<div class="{cls}">{badge_html}<div class="tier-name">{esc(name)}</div>'
             f'<div class="tier-tag">{esc(tag)}</div><div class="tier-price">{esc(price)}</div>'
+            f'<div class="tier-benefit">{esc(benefit)}</div>'
             f'{feats}</div>'
         )
     html_out += "</div>"
     st.markdown(html_out, unsafe_allow_html=True)
-    st.caption("Prices shown are placeholders pending checkout setup. Results are not a "
-               "consumer report and may not be used for FCRA-covered decisions.")
+    st.caption("Card checkout is being finalized — pricing shown is current. Cancel anytime. "
+               "Results are not a consumer report and may not be used for FCRA-covered decisions.")
 
     st.markdown("")
     if st.button("Start Searching", type="primary"):
@@ -1370,6 +1385,14 @@ def page_account(engine):
         + '</div></div>',
         unsafe_allow_html=True,
     )
+
+    rank = PLAN_RANK.get(plan, 0)
+    if rank < 2:
+        nxt_name, nxt_adds = {
+            0: ("Pro", "court records, company officers, subdomains, and phone & infrastructure intel"),
+            1: ("Deep", "breach & dark-web exposure plus scheduled monitoring with change alerts"),
+        }[rank]
+        st.caption(f"Your plan doesn't yet include {nxt_adds}. {nxt_name} unlocks it.")
 
     if not stripe_enabled():
         st.info("Paid upgrades aren't live yet — set STRIPE_SECRET_KEY and the "
@@ -1791,6 +1814,31 @@ def render_osint_result(r):
                 st.markdown(f"- {line}")
 
 
+def render_upgrade_nudge(plan):
+    """Success-moment upgrade card. Shown only to users below the deepest plan,
+    right after they've seen everything their tier returned — tied to a real
+    limitation (the sources their plan didn't run), not manufactured friction.
+    States plainly what the next tier additionally checks. No fake urgency."""
+    rank = PLAN_RANK.get(plan, 0)
+    if rank >= 2:
+        return
+    target, price, what = {
+        0: ("Pro", "$34.99 / mo",
+            "court records, company officers, subdomains, phone intel, and host & port intel"),
+        1: ("Deep", "$59.99 / mo",
+            "breach & dark-web exposure (HaveIBeenPwned) and scheduled monitoring with change alerts"),
+    }[rank]
+    st.markdown(
+        f'<div class="upgrade-card"><div class="uc-label">Beyond this search</div>'
+        f'<div class="uc-title">{esc(target)} also checks {esc(what)}.</div>'
+        f'<div class="uc-meta">{esc(price)} · cancel anytime</div></div>',
+        unsafe_allow_html=True,
+    )
+    if st.button(f"Unlock {target} →", key="nudge_up"):
+        st.session_state.nav = "Account"
+        st.rerun()
+
+
 def page_search():
     render_brand_bar()
     user = require_login(engine)
@@ -1826,10 +1874,6 @@ def page_search():
                              help="Higher tiers run more (and deeper) sources. "
                                   "The deepest tier reaches breach / dark-web exposure data.")
         run = st.form_submit_button("Run Search", type="primary")
-
-    if PLAN_RANK.get(user.get("plan", "Recon"), 0) < 2:
-        st.caption("On your plan? You're searching the tiers your plan unlocks. "
-                   "Deeper tiers (incl. breach / dark-web exposure) unlock with Pro and Deep — see **Account**.")
 
     if run:
         query = {"name": name, "email": email, "username": username, "phone": phone, "domain": domain}
@@ -1881,6 +1925,8 @@ def page_search():
         st.markdown("#### Sources")
         for r in results:
             render_osint_result(r)
+
+        render_upgrade_nudge(user.get("plan", "Recon"))
 
         report = build_report_md(q, results, st.session_state.get("osint_summary"))
         subject_slug = re.sub(r"[^a-z0-9]+", "-", (shown or "report").lower())[:40].strip("-")
