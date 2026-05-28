@@ -15,6 +15,7 @@ from sqlalchemy import (
 )
 
 import osint_engine
+import llm
 
 st.set_page_config(
     page_title="H & H Investigation — Investigative Intelligence",
@@ -782,8 +783,54 @@ OSINT_STATUS = {"ok": "#2ea043", "not_found": "#5a6878", "no_key": "#c9a444", "e
 OSINT_LABEL = {"ok": "FOUND", "not_found": "NONE", "no_key": "NEEDS KEY", "error": "ERROR"}
 
 
+LLM_KEYS = ["OLLAMA_HOST", "OLLAMA_MODEL", "GEMINI_API_KEY", "GEMINI_MODEL",
+            "ANTHROPIC_API_KEY", "ANTHROPIC_MODEL"]
+
+
 def build_osint_cfg():
     return {k: get_config(k) for k in OSINT_KEYS}
+
+
+def build_llm_cfg():
+    return {k: get_config(k) for k in LLM_KEYS}
+
+
+def render_source_status(cfg):
+    """Compact 'which sources are live vs need a key' panel."""
+    chips = []
+    for s in osint_engine.SOURCES:
+        if s.key is None or cfg.get(s.key):
+            color, txt = "#2ea043", "live"
+        else:
+            color, txt = "#7a5f1a", f"needs {s.key}"
+        chips.append(
+            f'<span style="display:inline-block;margin:3px 8px 3px 0;font-family:var(--mono);'
+            f'font-size:11px;color:var(--text-2);">'
+            f'<span style="color:{color};">●</span> {esc(s.label)} '
+            f'<span style="color:var(--text-dim);">({esc(txt)})</span></span>'
+        )
+    st.markdown("".join(chips), unsafe_allow_html=True)
+
+
+def build_summary_prompt(query, results):
+    lines = ["You are an OSINT analyst. Write a concise, factual intelligence "
+             "summary of the findings below. Use neutral language, do not "
+             "speculate beyond the data, note where coverage is thin, and end "
+             "with a one-line confidence note. Findings:\n"]
+    q = ", ".join(f"{k}={v}" for k, v in query.items() if (v or "").strip())
+    lines.append(f"Search subject: {q}\n")
+    for r in results:
+        if r.status not in ("ok",):
+            continue
+        lines.append(f"\n## {r.source} ({r.category})")
+        if r.summary:
+            lines.append(r.summary)
+        for k, v in (r.detail or {}).items():
+            if v:
+                lines.append(f"- {k}: {v}")
+        for it in (r.items or [])[:8]:
+            lines.append("- " + "; ".join(f"{k}: {v}" for k, v in it.items() if v))
+    return "\n".join(lines)
 
 
 def render_osint_result(r):
@@ -825,6 +872,10 @@ def page_search():
         "credit, tenant, or insurance decisions, or to harass or stalk any person."
     )
 
+    osint_cfg = build_osint_cfg()
+    with st.expander("Source status — which lookups are live vs. need a key"):
+        render_source_status(osint_cfg)
+
     with st.form("osint_form"):
         c1, c2 = st.columns(2)
         with c1:
@@ -842,10 +893,11 @@ def page_search():
             st.error("Enter at least one identifier to search.")
         else:
             with st.spinner("Querying sources…"):
-                results = osint_engine.run_search(query, build_osint_cfg())
+                results = osint_engine.run_search(query, osint_cfg)
                 log_search(engine, query, results)
                 st.session_state.osint_results = results
                 st.session_state.osint_query = query
+                st.session_state.pop("osint_summary", None)
 
     results = st.session_state.get("osint_results")
     if results:
@@ -854,11 +906,40 @@ def page_search():
         found = sum(1 for r in results if r.status == "ok")
         st.markdown(f"**Query:** {shown}")
         st.caption(f"{found} of {len(results)} sources returned data.")
+
+        # AI summary — runs on the cheapest available provider (local Ollama
+        # first, then Gemini, then optional Claude).
+        llm_cfg = build_llm_cfg()
+        provider = llm.provider_label(llm_cfg)
+        cols = st.columns([1, 2])
+        with cols[0]:
+            if provider and found:
+                if st.button("Generate AI summary"):
+                    with st.spinner(f"Summarizing via {provider}…"):
+                        text, used = llm.generate(build_summary_prompt(q, results), llm_cfg)
+                    if text:
+                        st.session_state.osint_summary = text
+                    else:
+                        st.session_state.osint_summary = None
+                        st.session_state.osint_summary_err = used
+        with cols[1]:
+            if provider:
+                st.caption(f"AI summary engine: {provider}")
+            else:
+                st.caption("AI summary off — start Ollama locally or set GEMINI_API_KEY to enable.")
+
+        if st.session_state.get("osint_summary"):
+            st.markdown("#### AI summary")
+            st.markdown(esc(st.session_state.osint_summary).replace("\n", "  \n"))
+        elif st.session_state.get("osint_summary_err"):
+            st.warning(f"Summary failed: {esc(st.session_state.osint_summary_err)}")
+
+        st.markdown("#### Sources")
         for r in results:
             render_osint_result(r)
         if st.button("Clear results"):
-            st.session_state.pop("osint_results", None)
-            st.session_state.pop("osint_query", None)
+            for k in ("osint_results", "osint_query", "osint_summary", "osint_summary_err"):
+                st.session_state.pop(k, None)
             st.rerun()
 
     render_footer()
