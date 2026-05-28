@@ -583,6 +583,21 @@ def public_reviews(engine, limit=6):
         ).mappings().all()
 
 
+def review_summary(engine):
+    """Aggregate of approved reviews for the social-proof bar. Returns
+    {"count", "avg", "stars"} or None when none are approved — so any caller
+    inherits the same hidden-until-real guarantee as public_reviews."""
+    with engine.connect() as conn:
+        rows = conn.execute(
+            select(reviews_t.c.rating).where(reviews_t.c.approved.is_(True))
+        ).all()
+    if not rows:
+        return None
+    ratings = [int(r[0] or 0) for r in rows]
+    avg = sum(ratings) / len(ratings)
+    return {"count": len(ratings), "avg": round(avg, 1), "stars": "★" * int(round(avg))}
+
+
 def set_review_approved(engine, review_id, approved):
     with engine.begin() as conn:
         conn.execute(reviews_t.update().where(reviews_t.c.id == review_id).values(approved=approved))
@@ -653,6 +668,23 @@ def notify_new_request(ref, token, data):
         send_email(admin_to, f"[Intake] {ref} — {data['subject_name']}", admin_msg)
 
     return client_sent
+
+
+def notify_subscription_active(user, plan):
+    """One-time welcome + honest review invite, sent right after a confirmed
+    upgrade. No-op if SMTP is unconfigured (send_email returns False)."""
+    base = app_base_url()
+    body = (
+        f"You're on H&H {plan} — thank you.\n\n"
+        f"Your account now unlocks the {plan} tier of search depth. Sign in and run "
+        f"a search any time at {base}/.\n\n"
+        f"If the tool earns it, we'd value an honest review. From your Account page you "
+        f"can leave one in a minute. It only appears publicly after we review it, and "
+        f"you can edit or remove it whenever you like.\n\n"
+        f"Questions or feedback? Just reply to this email.\n\n"
+        f"— H&H Investigation"
+    )
+    return send_email(user.get("email"), f"Welcome to H&H {plan}", body)
 
 
 # ---------------------------------------------------------------------------
@@ -975,6 +1007,10 @@ st.markdown(
     .rv-body { font-family: var(--body); font-size: 14px; color: var(--text-2); line-height: 1.7; font-style: italic; margin-bottom: 14px; }
     .rv-who { font-family: var(--display); font-size: 16px; font-weight: 700; color: var(--text); }
     .rv-role { font-family: var(--mono); font-size: 10px; letter-spacing: 1px; color: var(--text-dim); text-transform: uppercase; margin-top: 3px; }
+    .rv-summary { display: flex; align-items: baseline; gap: 12px; margin-top: 20px; padding: 14px 18px; background: var(--bg-2); border: 1px solid var(--border); border-left: 2px solid var(--gold); }
+    .rv-summary-stars { color: var(--gold); font-size: 16px; letter-spacing: 2px; }
+    .rv-summary-avg { font-family: var(--display); font-size: 22px; font-weight: 700; color: var(--gold); line-height: 1; }
+    .rv-summary-meta { font-family: var(--mono); font-size: 10px; letter-spacing: 2px; color: var(--text-dim); text-transform: uppercase; }
 
     .status-badge { display: inline-block; padding: 3px 10px; border-radius: 3px; font-family: var(--mono); font-size: 10px; letter-spacing: 1.5px; text-transform: uppercase; color: #fff; }
 
@@ -1169,7 +1205,9 @@ def handle_stripe_return(engine):
             if uid:
                 row = get_user_by_id(engine, uid)
                 if row:
-                    st.session_state.user = dict(row)
+                    urow = dict(row)
+                    st.session_state.user = urow
+                    notify_subscription_active(urow, urow.get("plan", "Pro"))
                 msg = "Subscription active — your plan has been updated."
         except Exception:
             pass
@@ -1719,6 +1757,16 @@ def render_testimonials(engine):
         return
     st.markdown('<div class="section-label">What customers say</div>', unsafe_allow_html=True)
     st.markdown('<div class="section-title">In Their <em>Words</em></div>', unsafe_allow_html=True)
+    summary = review_summary(engine)
+    if summary:
+        noun = "review" if summary["count"] == 1 else "reviews"
+        st.markdown(
+            f'<div class="rv-summary"><span class="rv-summary-stars">{summary["stars"]}</span>'
+            f'<span class="rv-summary-avg">{summary["avg"]:.1f}</span>'
+            f'<span class="rv-summary-meta">average from {summary["count"]} '
+            f'verified customer {noun}</span></div>',
+            unsafe_allow_html=True,
+        )
     cards = '<div class="tier-grid">'
     for r in rows:
         stars = "★" * int(r["rating"] or 0)
