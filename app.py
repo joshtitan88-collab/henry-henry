@@ -3,11 +3,14 @@ import os
 import json
 import html
 import re
+import hashlib
 import secrets
 import smtplib
 import ssl
 import datetime
 from email.message import EmailMessage
+
+import requests
 
 from sqlalchemy import (
     create_engine, MetaData, Table, Column,
@@ -60,6 +63,16 @@ DEPTHS = {
     "Pro — public records & infrastructure": DEPTH_PRO,
     "Deep — adds breach & dark-web exposure": DEPTH_DEEP,
 }
+
+# Which plan unlocks which depth tiers. A plan can select any depth at or below
+# its rank. Plans map 1:1 to the first N depth tiers.
+PLAN_RANK = {"Recon": 0, "Pro": 1, "Deep": 2}
+
+
+def allowed_depths(plan):
+    """Depth-tier labels a plan may select (its rank and everything below)."""
+    keys = list(DEPTHS.keys())
+    return keys[: PLAN_RANK.get(plan, 0) + 1]
 
 # Public-facing plan cards (Home). Prices are placeholders — set your own.
 PLANS = [
@@ -263,6 +276,22 @@ searches_t = Table(
     Column("summary", Text),    # JSON: [{source, status, items, latency_ms, error}]
     Column("n_sources", Integer),
     Column("n_ok", Integer),
+)
+
+# User accounts. A plan ("Recon" free / "Pro" / "Deep") controls how deep a
+# user's searches can go. Stripe fields stay empty until a subscription is made.
+users_t = Table(
+    "users", metadata,
+    Column("id", Integer, primary_key=True, autoincrement=True),
+    Column("email", String(255), unique=True),
+    Column("pw_salt", String(64)),
+    Column("pw_hash", String(128)),
+    Column("created_at", DateTime(timezone=True)),
+    Column("plan", String(20), default="Recon"),
+    Column("plan_status", String(30), default="free"),
+    Column("stripe_customer_id", String(64)),
+    Column("stripe_subscription_id", String(64)),
+    Column("current_period_end", DateTime(timezone=True)),
 )
 
 # Saved searches that monitor.py re-runs on a schedule, alerting on change.
@@ -528,6 +557,192 @@ def notify_new_request(ref, token, data):
 
 
 # ---------------------------------------------------------------------------
+# Accounts + auth (email + password; PBKDF2 hashing, no extra deps)
+# ---------------------------------------------------------------------------
+def _hash_password(password, salt=None):
+    salt = salt or secrets.token_hex(16)
+    dk = hashlib.pbkdf2_hmac("sha256", password.encode(), bytes.fromhex(salt), 200_000)
+    return salt, dk.hex()
+
+
+def create_user(engine, email, password):
+    """Create a free-plan account. Returns (user_row, error_str)."""
+    email = email.strip().lower()
+    if not EMAIL_RE.match(email):
+        return None, "Enter a valid email address."
+    if len(password) < 8:
+        return None, "Password must be at least 8 characters."
+    salt, pw_hash = _hash_password(password)
+    now = datetime.datetime.now(datetime.timezone.utc)
+    try:
+        with engine.begin() as conn:
+            conn.execute(users_t.insert().values(
+                email=email, pw_salt=salt, pw_hash=pw_hash, created_at=now,
+                plan="Recon", plan_status="free",
+            ))
+    except Exception:  # unique-constraint or DB error
+        return None, "An account with that email already exists."
+    return get_user_by_email(engine, email), None
+
+
+def get_user_by_email(engine, email):
+    with engine.connect() as conn:
+        return conn.execute(
+            select(users_t).where(users_t.c.email == email.strip().lower())
+        ).mappings().first()
+
+
+def get_user_by_id(engine, user_id):
+    with engine.connect() as conn:
+        return conn.execute(
+            select(users_t).where(users_t.c.id == user_id)
+        ).mappings().first()
+
+
+def verify_login(engine, email, password):
+    row = get_user_by_email(engine, email)
+    if not row:
+        return None
+    _, attempt = _hash_password(password, row["pw_salt"])
+    if secrets.compare_digest(attempt, row["pw_hash"] or ""):
+        return row
+    return None
+
+
+def set_user_subscription(engine, user_id, customer_id, sub_id, plan, status, period_end):
+    with engine.begin() as conn:
+        conn.execute(users_t.update().where(users_t.c.id == user_id).values(
+            stripe_customer_id=customer_id, stripe_subscription_id=sub_id,
+            plan=plan, plan_status=status, current_period_end=period_end,
+        ))
+
+
+def downgrade_user(engine, user_id):
+    with engine.begin() as conn:
+        conn.execute(users_t.update().where(users_t.c.id == user_id).values(
+            plan="Recon", plan_status="canceled",
+        ))
+
+
+# ---------------------------------------------------------------------------
+# Stripe (raw REST via requests; dormant unless STRIPE_SECRET_KEY is set)
+# ---------------------------------------------------------------------------
+STRIPE_API = "https://api.stripe.com/v1"
+
+
+def stripe_enabled():
+    return bool(get_config("STRIPE_SECRET_KEY"))
+
+
+def _stripe_post(path, data):
+    r = requests.post(f"{STRIPE_API}{path}", data=data,
+                      auth=(get_config("STRIPE_SECRET_KEY"), ""), timeout=20)
+    r.raise_for_status()
+    return r.json()
+
+
+def _stripe_get(path):
+    r = requests.get(f"{STRIPE_API}{path}",
+                     auth=(get_config("STRIPE_SECRET_KEY"), ""), timeout=20)
+    r.raise_for_status()
+    return r.json()
+
+
+def plan_price_id(plan):
+    return get_config(f"STRIPE_PRICE_{plan.upper()}")
+
+
+def price_to_plan(price_id):
+    for plan in ("Pro", "Deep"):
+        if price_id and plan_price_id(plan) == price_id:
+            return plan
+    return None
+
+
+def app_base_url():
+    return (get_config("APP_BASE_URL", "http://localhost:8501") or "").rstrip("/")
+
+
+def create_checkout_url(user, plan):
+    """Create a Stripe Checkout subscription session; return its URL."""
+    price = plan_price_id(plan)
+    if not price:
+        raise RuntimeError(f"No Stripe price configured for {plan} (set STRIPE_PRICE_{plan.upper()}).")
+    base = app_base_url()
+    data = {
+        "mode": "subscription",
+        "line_items[0][price]": price,
+        "line_items[0][quantity]": 1,
+        "client_reference_id": str(user["id"]),
+        "metadata[plan]": plan,
+        "subscription_data[metadata][plan]": plan,
+        "success_url": base + "/?session_id={CHECKOUT_SESSION_ID}",
+        "cancel_url": base + "/?checkout=cancel",
+    }
+    if user.get("stripe_customer_id"):
+        data["customer"] = user["stripe_customer_id"]
+    else:
+        data["customer_email"] = user["email"]
+    return _stripe_post("/checkout/sessions", data)["url"]
+
+
+def create_billing_portal_url(customer_id):
+    return _stripe_post("/billing_portal/sessions",
+                        {"customer": customer_id, "return_url": app_base_url() + "/"})["url"]
+
+
+def _ts_to_dt(ts):
+    try:
+        return datetime.datetime.fromtimestamp(int(ts), datetime.timezone.utc)
+    except (TypeError, ValueError):
+        return None
+
+
+def confirm_checkout(engine, session_id):
+    """Verify a returned Checkout session with Stripe and, if paid, attach the
+    subscription to the user named by client_reference_id. Returns the user id
+    that was updated, or None."""
+    sess = _stripe_get(f"/checkout/sessions/{session_id}")
+    if sess.get("payment_status") != "paid" and sess.get("status") != "complete":
+        return None
+    user_id = sess.get("client_reference_id")
+    sub_id = sess.get("subscription")
+    cust_id = sess.get("customer")
+    plan = (sess.get("metadata") or {}).get("plan") or "Pro"
+    if not user_id:
+        return None
+    period_end = None
+    if sub_id:
+        sub = _stripe_get(f"/subscriptions/{sub_id}")
+        period_end = _ts_to_dt(sub.get("current_period_end"))
+        mapped = price_to_plan((sub.get("items", {}).get("data", [{}])[0].get("price") or {}).get("id"))
+        plan = mapped or plan
+    set_user_subscription(engine, int(user_id), cust_id, sub_id, plan, "active", period_end)
+    return int(user_id)
+
+
+def refresh_subscription(engine, user):
+    """Poll Stripe for the user's current subscription state and sync the plan.
+    No-op if Stripe is off or the user has no subscription."""
+    if not stripe_enabled() or not user or not user.get("stripe_subscription_id"):
+        return user
+    try:
+        sub = _stripe_get(f"/subscriptions/{user['stripe_subscription_id']}")
+    except Exception:
+        return user
+    status = sub.get("status")
+    if status in ("active", "trialing"):
+        price_id = (sub.get("items", {}).get("data", [{}])[0].get("price") or {}).get("id")
+        plan = price_to_plan(price_id) or user["plan"]
+        set_user_subscription(engine, user["id"], user.get("stripe_customer_id"),
+                              user["stripe_subscription_id"], plan, status,
+                              _ts_to_dt(sub.get("current_period_end")))
+    else:
+        downgrade_user(engine, user["id"])
+    return get_user_by_id(engine, user["id"])
+
+
+# ---------------------------------------------------------------------------
 # CSS
 # ---------------------------------------------------------------------------
 st.markdown(
@@ -700,6 +915,67 @@ def require_consent():
         st.markdown(ACCEPTABLE_USE_SUMMARY)
 
     return False
+
+
+# ---------------------------------------------------------------------------
+# Login gate (email + password). Returns the user row or None.
+# ---------------------------------------------------------------------------
+def require_login(engine):
+    user = st.session_state.get("user")
+    if user:
+        return user
+
+    st.markdown('<div class="section-label">Account required</div>', unsafe_allow_html=True)
+    st.markdown('<div class="section-title">Sign <em>In</em></div>', unsafe_allow_html=True)
+    st.caption("Free Recon-tier account. Upgrade anytime for deeper searches.")
+    tab_login, tab_signup = st.tabs(["Log in", "Create account"])
+
+    with tab_login:
+        with st.form("login_form"):
+            email = st.text_input("Email", key="login_email")
+            pw = st.text_input("Password", type="password", key="login_pw")
+            if st.form_submit_button("Log in", type="primary"):
+                row = verify_login(engine, email, pw)
+                if row:
+                    st.session_state.user = dict(row)
+                    st.rerun()
+                else:
+                    st.error("Invalid email or password.")
+
+    with tab_signup:
+        with st.form("signup_form"):
+            email2 = st.text_input("Email", key="signup_email")
+            pw2 = st.text_input("Password (8+ characters)", type="password", key="signup_pw")
+            if st.form_submit_button("Create free account", type="primary"):
+                row, err = create_user(engine, email2, pw2)
+                if err:
+                    st.error(err)
+                else:
+                    st.session_state.user = dict(row)
+                    st.rerun()
+    return None
+
+
+def handle_stripe_return(engine):
+    """Process a Stripe Checkout redirect (?session_id=...) exactly once."""
+    sid = st.query_params.get("session_id")
+    if not sid or st.session_state.get("_checkout_done"):
+        return
+    st.session_state["_checkout_done"] = True
+    msg = "Checkout could not be confirmed. If you were charged, contact support."
+    if stripe_enabled():
+        try:
+            uid = confirm_checkout(engine, sid)
+            if uid:
+                row = get_user_by_id(engine, uid)
+                if row:
+                    st.session_state.user = dict(row)
+                msg = "Subscription active — your plan has been updated."
+        except Exception:
+            pass
+    st.session_state["_checkout_msg"] = msg
+    st.session_state.nav = "Account"
+    st.query_params.clear()
 
 
 # ---------------------------------------------------------------------------
@@ -925,6 +1201,72 @@ def page_my_requests(engine):
         """,
         unsafe_allow_html=True,
     )
+    render_footer()
+
+
+# ---------------------------------------------------------------------------
+# Page: Account (plan + subscription management)
+# ---------------------------------------------------------------------------
+def page_account(engine):
+    render_brand_bar()
+    user = require_login(engine)
+    if not user:
+        render_footer()
+        return
+
+    # Sync plan with Stripe (no-op if Stripe off or no subscription).
+    fresh = refresh_subscription(engine, user)
+    if fresh:
+        st.session_state.user = dict(fresh)
+        user = st.session_state.user
+
+    _msg = st.session_state.pop("_checkout_msg", None)
+    if _msg:
+        st.success(_msg)
+
+    st.markdown('<div class="section-label">Account</div>', unsafe_allow_html=True)
+    st.markdown('<div class="section-title">Your <em>Plan</em></div>', unsafe_allow_html=True)
+    plan = user.get("plan", "Recon")
+    status = user.get("plan_status", "free")
+    st.markdown(
+        f'<div class="request-card"><div class="rc-meta">'
+        f'Signed in as <strong style="color:#eaeef4;">{esc(user["email"])}</strong><br>'
+        f'Current plan: <strong style="color:#c9a444;">{esc(plan)}</strong> · {esc(status)}<br>'
+        f'Search depth unlocked: {esc(", ".join(allowed_depths(plan)))}'
+        + (f'<br>Renews / expires: {esc(str(user["current_period_end"])[:10])}'
+           if user.get("current_period_end") else "")
+        + '</div></div>',
+        unsafe_allow_html=True,
+    )
+
+    if not stripe_enabled():
+        st.info("Paid upgrades aren't live yet — set STRIPE_SECRET_KEY and the "
+                "STRIPE_PRICE_PRO / STRIPE_PRICE_DEEP price IDs to enable checkout.")
+    else:
+        st.markdown("#### Change plan")
+        cols = st.columns(2)
+        for i, target in enumerate(("Pro", "Deep")):
+            with cols[i]:
+                if PLAN_RANK[plan] >= PLAN_RANK[target]:
+                    st.button(f"{target} — active or included", disabled=True, key=f"up_{target}")
+                elif not plan_price_id(target):
+                    st.button(f"{target} — price not set", disabled=True, key=f"up_{target}")
+                elif st.button(f"Upgrade to {target}", type="primary", key=f"up_{target}"):
+                    try:
+                        url = create_checkout_url(user, target)
+                        st.link_button(f"Continue to secure checkout →", url)
+                    except Exception as e:
+                        st.error(f"Could not start checkout: {e}")
+        if user.get("stripe_customer_id") and st.button("Manage billing / cancel"):
+            try:
+                st.link_button("Open billing portal →", create_billing_portal_url(user["stripe_customer_id"]))
+            except Exception as e:
+                st.error(f"Could not open billing portal: {e}")
+
+    st.divider()
+    if st.button("Log out", key="user_logout"):
+        st.session_state.pop("user", None)
+        st.rerun()
     render_footer()
 
 
@@ -1319,6 +1661,10 @@ def render_osint_result(r):
 
 def page_search():
     render_brand_bar()
+    user = require_login(engine)
+    if not user:
+        render_footer()
+        return
     if not require_consent():
         render_footer()
         return
@@ -1343,11 +1689,15 @@ def page_search():
         with c2:
             phone = st.text_input("Phone")
             domain = st.text_input("Domain", placeholder="example.com")
-        depth_names = list(DEPTHS.keys())
+        depth_names = allowed_depths(user.get("plan", "Recon"))
         depth = st.selectbox("Search depth", depth_names, index=len(depth_names) - 1,
                              help="Higher tiers run more (and deeper) sources. "
                                   "The deepest tier reaches breach / dark-web exposure data.")
         run = st.form_submit_button("Run Search", type="primary")
+
+    if PLAN_RANK.get(user.get("plan", "Recon"), 0) < 2:
+        st.caption("On your plan? You're searching the tiers your plan unlocks. "
+                   "Deeper tiers (incl. breach / dark-web exposure) unlock with Pro and Deep — see **Account**.")
 
     if run:
         query = {"name": name, "email": email, "username": username, "phone": phone, "domain": domain}
@@ -1420,6 +1770,7 @@ def page_search():
 # Router
 # ---------------------------------------------------------------------------
 engine = get_engine()
+handle_stripe_return(engine)
 
 st.sidebar.markdown(
     """
@@ -1432,8 +1783,18 @@ st.sidebar.markdown(
     unsafe_allow_html=True,
 )
 
-pages = ["Home", "Search", "New Request", "My Requests", "Terms", "Admin"]
-default_idx = pages.index(st.session_state.get("nav", "Home"))
+_u = st.session_state.get("user")
+if _u:
+    st.sidebar.markdown(
+        f"<div style='text-align:center;font-family:IBM Plex Mono,monospace;font-size:11px;"
+        f"color:#5a6878;padding-bottom:10px;'>{esc(_u['email'])}<br>"
+        f"plan: <span style='color:#c9a444;'>{esc(_u.get('plan','Recon'))}</span></div>",
+        unsafe_allow_html=True,
+    )
+
+pages = ["Home", "Search", "New Request", "My Requests", "Account", "Terms", "Admin"]
+nav = st.session_state.get("nav", "Home")
+default_idx = pages.index(nav) if nav in pages else 0
 page = st.sidebar.radio("Navigation", pages, index=default_idx, label_visibility="collapsed")
 if st.session_state.get("nav") and st.session_state.nav != page:
     st.session_state.nav = page
@@ -1446,6 +1807,8 @@ elif page == "New Request":
     page_new_request(engine)
 elif page == "My Requests":
     page_my_requests(engine)
+elif page == "Account":
+    page_account(engine)
 elif page == "Terms":
     page_terms()
 elif page == "Admin":

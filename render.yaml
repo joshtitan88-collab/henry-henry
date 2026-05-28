@@ -49,6 +49,17 @@ services:
         sync: false
       - key: ANTHROPIC_API_KEY
         sync: false
+      # Payments (Stripe). Subscriptions stay off until these are set. Create
+      # two recurring prices in Stripe and paste their price IDs here.
+      - key: STRIPE_SECRET_KEY
+        sync: false
+      - key: STRIPE_PRICE_PRO
+        sync: false
+      - key: STRIPE_PRICE_DEEP
+        sync: false
+      # Absolute base URL of the deployed app — used for Stripe redirect URLs.
+      - key: APP_BASE_URL
+        value: https://hhinvestigations.com
 
   # Scheduled monitoring: re-runs saved monitors and emails on change.
   - type: cron
