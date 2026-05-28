@@ -1,5 +1,6 @@
 import streamlit as st
 import os
+import json
 import html
 import re
 import secrets
@@ -12,6 +13,8 @@ from sqlalchemy import (
     create_engine, MetaData, Table, Column,
     Integer, String, Text, DateTime, Boolean, select, func,
 )
+
+import osint_engine
 
 st.set_page_config(
     page_title="H & H Investigation — Investigative Intelligence",
@@ -86,6 +89,20 @@ requests_t = Table(
     Column("notes", Text),
     Column("status", String(50)),
     Column("admin_notes", Text),
+)
+
+# Persistence + learning substrate: every OSINT search is logged here so the
+# system accumulates a dataset of what was searched, which sources answered,
+# how fast, and where coverage gaps are — the basis for measuring and improving
+# source performance over time.
+searches_t = Table(
+    "searches", metadata,
+    Column("id", Integer, primary_key=True, autoincrement=True),
+    Column("created_at", DateTime(timezone=True)),
+    Column("query", Text),      # JSON: the non-empty query fields
+    Column("summary", Text),    # JSON: [{source, status, items, latency_ms, error}]
+    Column("n_sources", Integer),
+    Column("n_ok", Integer),
 )
 
 
@@ -166,6 +183,67 @@ def update_request(engine, ref_number, new_status, admin_notes):
             .where(requests_t.c.ref_number == ref_number)
             .values(status=new_status, admin_notes=admin_notes, updated_at=now)
         )
+
+
+# ---------------------------------------------------------------------------
+# Search persistence + learning data
+# ---------------------------------------------------------------------------
+def log_search(engine, query, results):
+    """Persist one search and its per-source outcome. Best-effort: a logging
+    failure must never break the search itself."""
+    now = datetime.datetime.now(datetime.timezone.utc)
+    summary = [{
+        "source": r.source, "status": r.status, "items": len(r.items),
+        "latency_ms": getattr(r, "latency_ms", 0), "error": (r.error or "")[:200],
+    } for r in results]
+    q = {k: v for k, v in query.items() if (v or "").strip()}
+    try:
+        with engine.begin() as conn:
+            conn.execute(searches_t.insert().values(
+                created_at=now,
+                query=json.dumps(q),
+                summary=json.dumps(summary),
+                n_sources=len(results),
+                n_ok=sum(1 for r in results if r.status == "ok"),
+            ))
+    except Exception:  # noqa: BLE001 — never let logging break the search
+        pass
+
+
+def recent_searches(engine, limit=50):
+    with engine.connect() as conn:
+        return conn.execute(
+            select(searches_t).order_by(searches_t.c.id.desc()).limit(limit)
+        ).mappings().all()
+
+
+def source_stats(engine, limit=1000):
+    """Aggregate per-source reliability from the search log — the metric the
+    system uses to track how well each source is doing its job."""
+    rows = recent_searches(engine, limit=limit)
+    stats = {}
+    for row in rows:
+        try:
+            summary = json.loads(row["summary"] or "[]")
+        except (ValueError, TypeError):
+            continue
+        for entry in summary:
+            s = stats.setdefault(entry["source"], {
+                "ok": 0, "not_found": 0, "no_key": 0, "error": 0,
+                "total": 0, "latency_sum": 0, "latency_n": 0,
+            })
+            s["total"] += 1
+            s[entry.get("status", "error")] = s.get(entry.get("status", "error"), 0) + 1
+            lat = entry.get("latency_ms") or 0
+            if lat:
+                s["latency_sum"] += lat
+                s["latency_n"] += 1
+    for s in stats.values():
+        answered = s["ok"] + s["not_found"]
+        s["success_rate"] = round(100 * s["ok"] / s["total"]) if s["total"] else 0
+        s["answer_rate"] = round(100 * answered / s["total"]) if s["total"] else 0
+        s["avg_latency_ms"] = round(s["latency_sum"] / s["latency_n"]) if s["latency_n"] else 0
+    return stats
 
 
 # ---------------------------------------------------------------------------
@@ -582,58 +660,206 @@ def page_admin(engine):
         return
 
     st.markdown('<div class="section-label">Admin</div>', unsafe_allow_html=True)
-    st.markdown('<div class="section-title">Request <em>Dashboard</em></div>', unsafe_allow_html=True)
+    st.markdown('<div class="section-title">Admin <em>Dashboard</em></div>', unsafe_allow_html=True)
     if st.button("Log out", key="admin_logout"):
         st.session_state.admin_auth = False
         st.rerun()
 
-    counts = status_counts(engine)
-    metric_html = '<div class="metric-row">'
-    for s in STATUS_ORDER:
-        metric_html += f'<div class="metric-card"><div class="metric-num">{counts[s]}</div><div class="metric-label">{esc(s)}</div></div>'
-    metric_html += "</div>"
-    st.markdown(metric_html, unsafe_allow_html=True)
+    tab_req, tab_analytics = st.tabs(["Requests", "Search Analytics"])
 
-    status_filter = st.selectbox("Filter by status", ["All"] + STATUS_ORDER, key="admin_status_filter")
-    rows = get_all_requests(engine, status=status_filter)
-    if not rows:
-        st.info("No requests match the current filter.")
-        render_footer()
+    with tab_req:
+        counts = status_counts(engine)
+        metric_html = '<div class="metric-row">'
+        for s in STATUS_ORDER:
+            metric_html += f'<div class="metric-card"><div class="metric-num">{counts[s]}</div><div class="metric-label">{esc(s)}</div></div>'
+        metric_html += "</div>"
+        st.markdown(metric_html, unsafe_allow_html=True)
+
+        status_filter = st.selectbox("Filter by status", ["All"] + STATUS_ORDER, key="admin_status_filter")
+        rows = get_all_requests(engine, status=status_filter)
+        if not rows:
+            st.info("No requests match the current filter.")
+        for r in rows:
+            with st.expander(f"{r['ref_number']} — {r['subject_name']} ({r['status']})"):
+                c1, c2 = st.columns(2)
+                with c1:
+                    st.markdown(f"**Client:** {r['client_name']}")
+                    st.markdown(f"**Email:** {r['client_email']}")
+                    st.markdown(f"**Firm:** {r['client_firm'] or '—'}")
+                    st.markdown(f"**Tier:** {r['service_tier']}")
+                    st.markdown(f"**Rush:** {'Yes' if r['rush'] else 'No'}")
+                with c2:
+                    st.markdown(f"**Subject:** {r['subject_name']}")
+                    anchors = []
+                    for label, key in [
+                        ("Phone", "anchor_phone"), ("Email", "anchor_email"),
+                        ("Address", "anchor_address"), ("DOB", "anchor_dob"),
+                        ("Employer", "anchor_employer"), ("Other", "anchor_other"),
+                    ]:
+                        if r[key]:
+                            anchors.append(f"{label}: {r[key]}")
+                    st.markdown("**Anchors:**  \n" + ("  \n".join(anchors) if anchors else "—"))
+                    if r["notes"]:
+                        st.markdown(f"**Notes:** {r['notes']}")
+                    st.markdown(f"**Created:** {str(r['created_at'])[:19]}")
+                    st.markdown(f"**Updated:** {str(r['updated_at'])[:19]}")
+
+                st.divider()
+                cur_idx = STATUS_ORDER.index(r["status"]) if r["status"] in STATUS_ORDER else 0
+                new_status = st.selectbox("Status", STATUS_ORDER, index=cur_idx, key=f"status_{r['ref_number']}")
+                admin_notes = st.text_area("Admin notes", value=r["admin_notes"] or "", key=f"notes_{r['ref_number']}")
+                if st.button("Save", key=f"save_{r['ref_number']}"):
+                    update_request(engine, r["ref_number"], new_status, admin_notes)
+                    st.success(f"Updated {r['ref_number']}.")
+                    st.rerun()
+
+    with tab_analytics:
+        render_search_analytics(engine)
+
+    render_footer()
+
+
+# ---------------------------------------------------------------------------
+# Admin: search analytics (the "learning" surface)
+# ---------------------------------------------------------------------------
+def render_search_analytics(engine):
+    searches = recent_searches(engine, limit=1000)
+    if not searches:
+        st.info("No searches logged yet. Run searches and source-performance data will accumulate here.")
         return
 
-    for r in rows:
-        with st.expander(f"{r['ref_number']} — {r['subject_name']} ({r['status']})"):
-            c1, c2 = st.columns(2)
-            with c1:
-                st.markdown(f"**Client:** {r['client_name']}")
-                st.markdown(f"**Email:** {r['client_email']}")
-                st.markdown(f"**Firm:** {r['client_firm'] or '—'}")
-                st.markdown(f"**Tier:** {r['service_tier']}")
-                st.markdown(f"**Rush:** {'Yes' if r['rush'] else 'No'}")
-            with c2:
-                st.markdown(f"**Subject:** {r['subject_name']}")
-                anchors = []
-                for label, key in [
-                    ("Phone", "anchor_phone"), ("Email", "anchor_email"),
-                    ("Address", "anchor_address"), ("DOB", "anchor_dob"),
-                    ("Employer", "anchor_employer"), ("Other", "anchor_other"),
-                ]:
-                    if r[key]:
-                        anchors.append(f"{label}: {r[key]}")
-                st.markdown("**Anchors:**  \n" + ("  \n".join(anchors) if anchors else "—"))
-                if r["notes"]:
-                    st.markdown(f"**Notes:** {r['notes']}")
-                st.markdown(f"**Created:** {str(r['created_at'])[:19]}")
-                st.markdown(f"**Updated:** {str(r['updated_at'])[:19]}")
+    total = len(searches)
+    avg_ok = round(sum(s["n_ok"] for s in searches) / total, 1)
+    st.markdown(
+        f'<div class="metric-row">'
+        f'<div class="metric-card"><div class="metric-num">{total}</div><div class="metric-label">Searches logged</div></div>'
+        f'<div class="metric-card"><div class="metric-num">{avg_ok}</div><div class="metric-label">Avg sources hit</div></div>'
+        f'</div>',
+        unsafe_allow_html=True,
+    )
 
-            st.divider()
-            cur_idx = STATUS_ORDER.index(r["status"]) if r["status"] in STATUS_ORDER else 0
-            new_status = st.selectbox("Status", STATUS_ORDER, index=cur_idx, key=f"status_{r['ref_number']}")
-            admin_notes = st.text_area("Admin notes", value=r["admin_notes"] or "", key=f"notes_{r['ref_number']}")
-            if st.button("Save", key=f"save_{r['ref_number']}"):
-                update_request(engine, r["ref_number"], new_status, admin_notes)
-                st.success(f"Updated {r['ref_number']}.")
-                st.rerun()
+    st.markdown("**Source reliability** — how each source is performing across logged searches.")
+    stats = source_stats(engine)
+    rows = []
+    for source, s in sorted(stats.items(), key=lambda kv: kv[1]["total"], reverse=True):
+        rows.append({
+            "Source": source,
+            "Runs": s["total"],
+            "Answer rate": f"{s['answer_rate']}%",
+            "Hit rate": f"{s['success_rate']}%",
+            "Errors": s["error"],
+            "Needs key": s["no_key"],
+            "Avg ms": s["avg_latency_ms"],
+        })
+    if rows:
+        st.dataframe(rows, width="stretch", hide_index=True)
+        degraded = [r["Source"] for r in rows
+                    if int(r["Errors"]) and int(r["Errors"]) >= max(1, int(0.5 * stats[r["Source"]]["total"]))]
+        if degraded:
+            st.warning("Degraded sources (high error rate) — investigate or heal: " + ", ".join(degraded))
+
+    st.markdown("**Recent searches**")
+    for s in searches[:25]:
+        try:
+            q = json.loads(s["query"] or "{}")
+        except (ValueError, TypeError):
+            q = {}
+        qstr = ", ".join(f"{esc(k)}={esc(v)}" for k, v in q.items()) or "—"
+        st.markdown(
+            f'<div class="rc-meta" style="padding:4px 0;border-bottom:1px solid var(--border);">'
+            f'{str(s["created_at"])[:19]} · {esc(s["n_ok"])}/{esc(s["n_sources"])} hit · {qstr}</div>',
+            unsafe_allow_html=True,
+        )
+
+
+# ---------------------------------------------------------------------------
+# Page: OSINT Search
+# ---------------------------------------------------------------------------
+OSINT_KEYS = ["HIBP_API_KEY", "OPENCORPORATES_API_KEY", "NUMVERIFY_API_KEY",
+              "GITHUB_TOKEN", "COURTLISTENER_TOKEN"]
+
+OSINT_STATUS = {"ok": "#2ea043", "not_found": "#5a6878", "no_key": "#c9a444", "error": "#c23b22"}
+OSINT_LABEL = {"ok": "FOUND", "not_found": "NONE", "no_key": "NEEDS KEY", "error": "ERROR"}
+
+
+def build_osint_cfg():
+    return {k: get_config(k) for k in OSINT_KEYS}
+
+
+def render_osint_result(r):
+    color = OSINT_STATUS.get(r.status, "#5a6878")
+    label = OSINT_LABEL.get(r.status, r.status.upper())
+    title = r.summary or r.error or label
+    with st.expander(f"{r.source} — {title}", expanded=(r.status == "ok")):
+        st.markdown(
+            f'<span class="status-badge" style="background:{color};">{label}</span> '
+            f'<span style="color:#5a6878;font-family:var(--mono);font-size:11px;letter-spacing:1px;">'
+            f'{esc(r.category)}</span>',
+            unsafe_allow_html=True,
+        )
+        if r.status == "error" and r.error:
+            st.caption(esc(r.error))
+        if r.status == "no_key":
+            st.caption(esc(r.summary))
+        for k, v in (r.detail or {}).items():
+            if v:
+                if isinstance(v, list):
+                    v = ", ".join(str(x) for x in v)
+                st.markdown(f"**{esc(k.replace('_', ' ').title())}:** {esc(v)}")
+        for it in (r.items or []):
+            url = it.get("url")
+            line = " · ".join(f"{esc(k)}: {esc(v)}" for k, v in it.items() if v and k != "url")
+            if url:
+                st.markdown(f"- [{esc(line or url)}]({url})")
+            else:
+                st.markdown(f"- {line}")
+
+
+def page_search():
+    render_brand_bar()
+    st.markdown('<div class="section-label">OSINT Search</div>', unsafe_allow_html=True)
+    st.markdown('<div class="section-title">Public-Record <em>Lookup</em></div>', unsafe_allow_html=True)
+    st.caption(
+        "Aggregates publicly available open-source and public-record signals. For lawful "
+        "research only. This is not a consumer report and may not be used for employment, "
+        "credit, tenant, or insurance decisions, or to harass or stalk any person."
+    )
+
+    with st.form("osint_form"):
+        c1, c2 = st.columns(2)
+        with c1:
+            name = st.text_input("Full name", placeholder="court records, company officers")
+            email = st.text_input("Email", placeholder="breach exposure, Gravatar")
+            username = st.text_input("Username / handle", placeholder="social footprint, GitHub")
+        with c2:
+            phone = st.text_input("Phone")
+            domain = st.text_input("Domain", placeholder="example.com")
+        run = st.form_submit_button("Run Search", type="primary")
+
+    if run:
+        query = {"name": name, "email": email, "username": username, "phone": phone, "domain": domain}
+        if not any((v or "").strip() for v in query.values()):
+            st.error("Enter at least one identifier to search.")
+        else:
+            with st.spinner("Querying sources…"):
+                results = osint_engine.run_search(query, build_osint_cfg())
+                log_search(engine, query, results)
+                st.session_state.osint_results = results
+                st.session_state.osint_query = query
+
+    results = st.session_state.get("osint_results")
+    if results:
+        q = st.session_state.get("osint_query", {})
+        shown = ", ".join(f"{esc(k)}={esc(v)}" for k, v in q.items() if (v or "").strip())
+        found = sum(1 for r in results if r.status == "ok")
+        st.markdown(f"**Query:** {shown}")
+        st.caption(f"{found} of {len(results)} sources returned data.")
+        for r in results:
+            render_osint_result(r)
+        if st.button("Clear results"):
+            st.session_state.pop("osint_results", None)
+            st.session_state.pop("osint_query", None)
+            st.rerun()
 
     render_footer()
 
@@ -654,7 +880,7 @@ st.sidebar.markdown(
     unsafe_allow_html=True,
 )
 
-pages = ["Home", "New Request", "My Requests", "Admin"]
+pages = ["Home", "Search", "New Request", "My Requests", "Admin"]
 default_idx = pages.index(st.session_state.get("nav", "Home"))
 page = st.sidebar.radio("Navigation", pages, index=default_idx, label_visibility="collapsed")
 if st.session_state.get("nav") and st.session_state.nav != page:
@@ -662,6 +888,8 @@ if st.session_state.get("nav") and st.session_state.nav != page:
 
 if page == "Home":
     page_home()
+elif page == "Search":
+    page_search()
 elif page == "New Request":
     page_new_request(engine)
 elif page == "My Requests":
