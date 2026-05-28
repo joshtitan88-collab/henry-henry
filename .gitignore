@@ -3,6 +3,8 @@ graphify-out/
 *.key
 *.txt
 !requirements.txt
+!requirements-prod.txt
 *.db
+.streamlit/secrets.toml
 .env
 .env.*

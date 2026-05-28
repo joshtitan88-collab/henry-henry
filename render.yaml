@@ -1,0 +1,32 @@
+services:
+  - type: web
+    name: hh-intake
+    runtime: python
+    plan: starter
+    buildCommand: pip install -r requirements-prod.txt
+    startCommand: streamlit run app.py --server.port $PORT --server.address 0.0.0.0 --server.headless true
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.12.7
+      - key: DATABASE_URL
+        fromDatabase:
+          name: hh-intake-db
+          property: connectionString
+      - key: ADMIN_PASSWORD
+        sync: false
+      - key: NOTIFY_EMAIL
+        sync: false
+      - key: SMTP_HOST
+        sync: false
+      - key: SMTP_PORT
+        sync: false
+      - key: SMTP_USERNAME
+        sync: false
+      - key: SMTP_PASSWORD
+        sync: false
+      - key: SMTP_FROM
+        sync: false
+
+databases:
+  - name: hh-intake-db
+    plan: starter
