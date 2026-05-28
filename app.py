@@ -666,7 +666,7 @@ def page_admin(engine):
         st.session_state.admin_auth = False
         st.rerun()
 
-    tab_req, tab_analytics = st.tabs(["Requests", "Search Analytics"])
+    tab_req, tab_analytics, tab_assistant = st.tabs(["Requests", "Search Analytics", "Assistant"])
 
     with tab_req:
         counts = status_counts(engine)
@@ -716,6 +716,9 @@ def page_admin(engine):
 
     with tab_analytics:
         render_search_analytics(engine)
+
+    with tab_assistant:
+        render_admin_assistant(engine)
 
     render_footer()
 
@@ -771,6 +774,73 @@ def render_search_analytics(engine):
             f'{str(s["created_at"])[:19]} · {esc(s["n_ok"])}/{esc(s["n_sources"])} hit · {qstr}</div>',
             unsafe_allow_html=True,
         )
+
+
+# ---------------------------------------------------------------------------
+# Admin: AI assistant (runs on the cheap LLM layer — Ollama/Gemini/Claude)
+# ---------------------------------------------------------------------------
+def admin_assistant_context(engine):
+    parts = [
+        "You are the in-app admin assistant for the Henry & Henry OSINT tool, a "
+        "Streamlit application. Help the admin understand and debug the app. Be "
+        "concise and practical. You can explain behavior and propose fixes, but you "
+        "cannot modify the running code yourself — code changes go through the "
+        "developer and a redeploy.",
+        "App pages: Home, Search (OSINT lookup), New Request (client intake), "
+        "My Requests (status lookup), Admin.",
+        "OSINT sources: " + ", ".join(s.label for s in osint_engine.SOURCES) + ".",
+    ]
+    try:
+        counts = status_counts(engine)
+        parts.append("Intake request counts: " + ", ".join(f"{k}={v}" for k, v in counts.items()) + ".")
+    except Exception:
+        pass
+    try:
+        stats = source_stats(engine)
+        if stats:
+            parts.append("Recent source reliability (hit% / errors): " + "; ".join(
+                f"{k} {v['success_rate']}%/{v['error']}" for k, v in stats.items()) + ".")
+    except Exception:
+        pass
+    return "\n".join(parts)
+
+
+def render_admin_assistant(engine):
+    cfg = build_llm_cfg()
+    provider = llm.provider_label(cfg)
+    if not provider:
+        st.info("AI assistant is off. Start Ollama locally (free) or set GEMINI_API_KEY "
+                "(cheap) to enable a debug chat here.")
+        return
+    st.caption(f"Assistant engine: {provider} · admin-only")
+    st.session_state.setdefault("admin_chat", [])
+
+    for m in st.session_state.admin_chat:
+        with st.chat_message(m["role"]):
+            st.markdown(m["content"])
+
+    # If the last message is from the user, generate a reply.
+    if st.session_state.admin_chat and st.session_state.admin_chat[-1]["role"] == "user":
+        convo = "\n".join(f"{m['role'].upper()}: {m['content']}" for m in st.session_state.admin_chat)
+        prompt = admin_assistant_context(engine) + "\n\nConversation:\n" + convo + "\nASSISTANT:"
+        with st.chat_message("assistant"):
+            with st.spinner("Thinking…"):
+                text, used = llm.generate(prompt, cfg)
+            if not text:
+                text = f"(assistant unavailable: {used})"
+            st.markdown(text)
+        st.session_state.admin_chat.append({"role": "assistant", "content": text})
+        st.rerun()
+
+    with st.form("admin_assistant_form", clear_on_submit=True):
+        msg = st.text_area("Ask the assistant", placeholder="e.g. why is the Reddit source erroring?")
+        if st.form_submit_button("Send") and msg.strip():
+            st.session_state.admin_chat.append({"role": "user", "content": msg.strip()})
+            st.rerun()
+
+    if st.session_state.admin_chat and st.button("Clear chat", key="clear_admin_chat"):
+        st.session_state.admin_chat = []
+        st.rerun()
 
 
 # ---------------------------------------------------------------------------
