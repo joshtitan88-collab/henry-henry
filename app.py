@@ -327,6 +327,25 @@ monitors_t = Table(
     Column("last_summary", Text),   # JSON
 )
 
+# Customer reviews. Submitted by signed-in users (one per user; resubmitting
+# replaces the prior one and re-enters moderation). Hidden until an admin
+# approves — the public site shows only real, vetted testimonials and stays
+# empty until they exist. Nothing is ever seeded or fabricated. Separate table
+# so metadata.create_all adds it cleanly to existing databases.
+reviews_t = Table(
+    "reviews", metadata,
+    Column("id", Integer, primary_key=True, autoincrement=True),
+    Column("user_id", Integer),
+    Column("display_name", String(80)),
+    Column("role", String(120)),
+    Column("rating", Integer),
+    Column("body", Text),
+    Column("approved", Boolean, default=False),
+    Column("featured", Boolean, default=False),
+    Column("created_at", DateTime(timezone=True)),
+    Column("updated_at", DateTime(timezone=True)),
+)
+
 
 @st.cache_resource
 def get_engine():
@@ -516,6 +535,67 @@ def run_monitor(engine, monitor, cfg):
                    f"The monitored search '{monitor['label']}' ({q}) changed.\n\n"
                    + build_report_md(query, results))
     return changed, results
+
+
+# ---------------------------------------------------------------------------
+# Reviews — real, opt-in customer testimonials (admin-moderated)
+# ---------------------------------------------------------------------------
+def get_user_review(engine, user_id):
+    with engine.connect() as conn:
+        return conn.execute(
+            select(reviews_t).where(reviews_t.c.user_id == user_id)
+        ).mappings().first()
+
+
+def upsert_review(engine, user_id, display_name, role, rating, body):
+    """One review per user. Submitting or editing always sets approved=False so
+    every change is re-moderated before it can appear publicly."""
+    now = datetime.datetime.now(datetime.timezone.utc)
+    existing = get_user_review(engine, user_id)
+    with engine.begin() as conn:
+        if existing:
+            conn.execute(reviews_t.update().where(reviews_t.c.id == existing["id"]).values(
+                display_name=display_name, role=role, rating=rating, body=body,
+                approved=False, updated_at=now,
+            ))
+        else:
+            conn.execute(reviews_t.insert().values(
+                user_id=user_id, display_name=display_name, role=role, rating=rating,
+                body=body, approved=False, featured=False, created_at=now, updated_at=now,
+            ))
+
+
+def list_reviews(engine):
+    """All reviews, pending first then newest — for the admin moderation queue."""
+    with engine.connect() as conn:
+        return conn.execute(
+            select(reviews_t).order_by(reviews_t.c.approved.asc(), reviews_t.c.id.desc())
+        ).mappings().all()
+
+
+def public_reviews(engine, limit=6):
+    """Approved reviews only, featured first. Returns [] when none are approved —
+    callers MUST render nothing in that case (no placeholder, no fabrication)."""
+    with engine.connect() as conn:
+        return conn.execute(
+            select(reviews_t).where(reviews_t.c.approved.is_(True))
+            .order_by(reviews_t.c.featured.desc(), reviews_t.c.id.desc()).limit(limit)
+        ).mappings().all()
+
+
+def set_review_approved(engine, review_id, approved):
+    with engine.begin() as conn:
+        conn.execute(reviews_t.update().where(reviews_t.c.id == review_id).values(approved=approved))
+
+
+def set_review_featured(engine, review_id, featured):
+    with engine.begin() as conn:
+        conn.execute(reviews_t.update().where(reviews_t.c.id == review_id).values(featured=featured))
+
+
+def delete_review(engine, review_id):
+    with engine.begin() as conn:
+        conn.execute(reviews_t.delete().where(reviews_t.c.id == review_id))
 
 
 # ---------------------------------------------------------------------------
@@ -891,6 +971,10 @@ st.markdown(
     .uc-label { font-family: var(--mono); font-size: 9px; letter-spacing: 2px; text-transform: uppercase; color: var(--gold-dim); margin-bottom: 7px; }
     .uc-title { font-family: var(--display); font-size: 19px; font-weight: 700; color: var(--text); line-height: 1.3; margin-bottom: 6px; }
     .uc-meta { font-family: var(--mono); font-size: 11px; color: var(--text-dim); letter-spacing: 0.5px; }
+    .rv-stars { color: var(--gold); font-size: 14px; letter-spacing: 2px; margin-bottom: 12px; }
+    .rv-body { font-family: var(--body); font-size: 14px; color: var(--text-2); line-height: 1.7; font-style: italic; margin-bottom: 14px; }
+    .rv-who { font-family: var(--display); font-size: 16px; font-weight: 700; color: var(--text); }
+    .rv-role { font-family: var(--mono); font-size: 10px; letter-spacing: 1px; color: var(--text-dim); text-transform: uppercase; margin-top: 3px; }
 
     .status-badge { display: inline-block; padding: 3px 10px; border-radius: 3px; font-family: var(--mono); font-size: 10px; letter-spacing: 1.5px; text-transform: uppercase; color: #fff; }
 
@@ -1181,6 +1265,8 @@ def page_home():
     st.caption("Card checkout is being finalized — pricing shown is current. Cancel anytime. "
                "Results are not a consumer report and may not be used for FCRA-covered decisions.")
 
+    render_testimonials(engine)
+
     st.markdown("")
     if st.button("Start Searching", type="primary"):
         st.session_state.nav = "Search"
@@ -1419,6 +1505,9 @@ def page_account(engine):
                 st.error(f"Could not open billing portal: {e}")
 
     st.divider()
+    render_review_form(engine, user)
+
+    st.divider()
     if st.button("Log out", key="user_logout"):
         st.session_state.pop("user", None)
         st.rerun()
@@ -1460,8 +1549,8 @@ def page_admin(engine):
         st.session_state.admin_auth = False
         st.rerun()
 
-    tab_req, tab_monitors, tab_analytics, tab_assistant = st.tabs(
-        ["Requests", "Monitors", "Search Analytics", "Assistant"])
+    tab_req, tab_reviews, tab_monitors, tab_analytics, tab_assistant = st.tabs(
+        ["Requests", "Reviews", "Monitors", "Search Analytics", "Assistant"])
 
     with tab_req:
         counts = status_counts(engine)
@@ -1508,6 +1597,9 @@ def page_admin(engine):
                     update_request(engine, r["ref_number"], new_status, admin_notes)
                     st.success(f"Updated {r['ref_number']}.")
                     st.rerun()
+
+    with tab_reviews:
+        render_admin_reviews(engine)
 
     with tab_monitors:
         render_admin_monitors(engine)
@@ -1575,6 +1667,106 @@ def render_admin_monitors(engine):
             with c3:
                 if st.button("Delete", key=f"delmon_{m['id']}"):
                     delete_monitor(engine, m["id"])
+                    st.rerun()
+
+
+# ---------------------------------------------------------------------------
+# Reviews UI — capture (Account), public display (Home), moderation (Admin)
+# ---------------------------------------------------------------------------
+def render_review_form(engine, user):
+    """Opt-in review capture for a signed-in customer. Submissions are hidden
+    until an admin approves them, and every edit re-enters moderation."""
+    existing = get_user_review(engine, user["id"])
+    st.markdown("#### Share your experience")
+    if existing:
+        state = "published" if existing["approved"] else "pending review — not yet public"
+        st.caption(f"You have a review on file ({state}). Editing it sends it back for approval.")
+    else:
+        st.caption("Used H&H for real work? An honest review helps others decide. "
+                   "It only appears publicly after we review and approve it.")
+    with st.form("review_form"):
+        display_name = st.text_input(
+            "Name to display", value=(existing["display_name"] if existing else ""),
+            max_chars=80, placeholder="e.g. Jordan M. or J. Marsh, Paralegal")
+        role = st.text_input(
+            "Role / context (optional)", value=(existing["role"] if existing else ""),
+            max_chars=120, placeholder="e.g. Investigator · Journalist · Small-business owner")
+        rating = st.slider("Rating", 1, 5, value=int(existing["rating"]) if existing else 5)
+        body = st.text_area(
+            "Your review", value=(existing["body"] if existing else ""),
+            max_chars=600, placeholder="What did the tool help you do? Be specific and honest.")
+        agree = st.checkbox(
+            "I agree H&H may publicly display this review with the name and role I entered, "
+            "and confirm it reflects my genuine experience.")
+        if st.form_submit_button("Submit review", type="primary"):
+            if not display_name.strip() or not body.strip():
+                st.error("A display name and a review are required.")
+            elif not agree:
+                st.error("Please confirm you agree to public display.")
+            else:
+                upsert_review(engine, user["id"], display_name.strip(), role.strip(),
+                              int(rating), body.strip())
+                st.success("Thank you — your review was submitted and is pending approval "
+                           "before it appears publicly.")
+                st.rerun()
+
+
+def render_testimonials(engine):
+    """Render approved customer reviews. If none are approved, render NOTHING —
+    the section simply does not exist until real, vetted reviews do."""
+    rows = public_reviews(engine, limit=6)
+    if not rows:
+        return
+    st.markdown('<div class="section-label">What customers say</div>', unsafe_allow_html=True)
+    st.markdown('<div class="section-title">In Their <em>Words</em></div>', unsafe_allow_html=True)
+    cards = '<div class="tier-grid">'
+    for r in rows:
+        stars = "★" * int(r["rating"] or 0)
+        role = f'<div class="rv-role">{esc(r["role"])}</div>' if r["role"] else ''
+        cards += (
+            f'<div class="tier-card"><div class="rv-stars">{stars}</div>'
+            f'<div class="rv-body">“{esc(r["body"])}”</div>'
+            f'<div class="rv-who">{esc(r["display_name"])}</div>{role}</div>'
+        )
+    cards += "</div>"
+    st.markdown(cards, unsafe_allow_html=True)
+
+
+def render_admin_reviews(engine):
+    st.caption("Real, opt-in customer reviews. Nothing appears on the public site "
+               "until you approve it here — there are no seeded or fabricated entries.")
+    rows = list_reviews(engine)
+    if not rows:
+        st.info("No reviews submitted yet. They'll appear here for approval once "
+                "signed-in customers leave them from their Account page.")
+        return
+    pending = sum(1 for r in rows if not r["approved"])
+    if pending:
+        st.markdown(f"**{pending}** awaiting approval.")
+    for r in rows:
+        n = int(r["rating"] or 0)
+        stars = "★" * n + "☆" * (5 - n)
+        state = "approved" if r["approved"] else "pending"
+        feat = " · featured" if r["featured"] else ""
+        with st.expander(f"{stars} — {r['display_name']} ({state}{feat})"):
+            if r["role"]:
+                st.markdown(f"*{esc(r['role'])}*")
+            st.markdown(esc(r["body"]))
+            st.caption(f"Submitted {str(r['created_at'])[:19]} · user #{r['user_id']}")
+            c1, c2, c3 = st.columns(3)
+            with c1:
+                if st.button("Unapprove" if r["approved"] else "Approve",
+                             key=f"aprv_{r['id']}",
+                             type="secondary" if r["approved"] else "primary"):
+                    set_review_approved(engine, r["id"], not r["approved"])
+                    st.rerun()
+            with c2:
+                if st.button("Unfeature" if r["featured"] else "Feature", key=f"feat_{r['id']}"):
+                    set_review_featured(engine, r["id"], not r["featured"])
+                    st.rerun()
+            with c3:
+                if st.button("Delete", key=f"delrev_{r['id']}"):
+                    delete_review(engine, r["id"])
                     st.rerun()
 
 
