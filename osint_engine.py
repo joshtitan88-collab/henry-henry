@@ -231,6 +231,120 @@ def src_domain(query, cfg):
 
 
 # ---------------------------------------------------------------------------
+# Source: DNS records via Google DoH (no key)
+# ---------------------------------------------------------------------------
+def src_dns(query, cfg):
+    domain = _q(query, "domain").lower().replace("https://", "").replace("http://", "").strip("/")
+    if not domain:
+        return Result("DNS records", "Infrastructure", "not_found", "No domain provided.")
+    records = {}
+    try:
+        for rtype in ("A", "AAAA", "MX", "NS", "TXT"):
+            r = _get("https://dns.google/resolve", params={"name": domain, "type": rtype})
+            answers = r.json().get("Answer", []) if r.status_code == 200 else []
+            vals = [a.get("data") for a in answers if a.get("data")]
+            if vals:
+                records[rtype] = vals
+    except (requests.RequestException, ValueError) as e:
+        return Result("DNS records", "Infrastructure", "error", error=str(e))
+    if not records:
+        return Result("DNS records", "Infrastructure", "not_found", f"No DNS records for {domain}.")
+    detail = {k: ", ".join(v[:6]) for k, v in records.items()}
+    return Result("DNS records", "Infrastructure", "ok",
+                  f"{sum(len(v) for v in records.values())} DNS record(s) for {domain}.", detail=detail)
+
+
+# ---------------------------------------------------------------------------
+# Source: certificate-transparency subdomains via crt.sh (no key)
+# ---------------------------------------------------------------------------
+def src_crtsh(query, cfg):
+    domain = _q(query, "domain").lower().replace("https://", "").replace("http://", "").strip("/")
+    if not domain:
+        return Result("Subdomains (crt.sh)", "Infrastructure", "not_found", "No domain provided.")
+    try:
+        r = _get("https://crt.sh/", params={"q": f"%.{domain}", "output": "json"})
+        if r.status_code != 200:
+            return Result("Subdomains (crt.sh)", "Infrastructure", "error",
+                          error=f"crt.sh returned {r.status_code}")
+        data = r.json()
+    except (requests.RequestException, ValueError) as e:
+        return Result("Subdomains (crt.sh)", "Infrastructure", "error", error=str(e))
+    subs = set()
+    for entry in data:
+        for n in (entry.get("name_value") or "").split("\n"):
+            n = n.strip().lstrip("*.")
+            if n.endswith(domain):
+                subs.add(n)
+    subs = sorted(subs)
+    if not subs:
+        return Result("Subdomains (crt.sh)", "Infrastructure", "not_found",
+                      f"No certificate-transparency records for {domain}.")
+    return Result("Subdomains (crt.sh)", "Infrastructure", "ok",
+                  f"{len(subs)} subdomain(s) seen in CT logs for {domain}.",
+                  items=[{"subdomain": s} for s in subs[:60]])
+
+
+# ---------------------------------------------------------------------------
+# Source: Reddit user (no key)
+# ---------------------------------------------------------------------------
+def src_reddit(query, cfg):
+    user = _q(query, "username")
+    if not user:
+        return Result("Reddit profile", "Identity", "not_found", "No username provided.")
+    try:
+        r = _get(f"https://www.reddit.com/user/{user}/about.json")
+        if r.status_code == 404:
+            return Result("Reddit profile", "Identity", "not_found", f"No Reddit user '{user}'.")
+        if r.status_code == 403:
+            return Result("Reddit profile", "Identity", "error",
+                          error="Reddit rate-limited this host.")
+        if r.status_code != 200:
+            return Result("Reddit profile", "Identity", "error",
+                          error=f"Reddit returned {r.status_code}")
+        d = r.json().get("data", {})
+        import datetime as _dt
+        created = d.get("created_utc")
+        detail = {
+            "link_karma": d.get("link_karma"),
+            "comment_karma": d.get("comment_karma"),
+            "created": _dt.datetime.utcfromtimestamp(created).date().isoformat() if created else None,
+            "verified": d.get("verified"),
+            "url": f"https://www.reddit.com/user/{user}",
+        }
+        return Result("Reddit profile", "Identity", "ok",
+                      f"Reddit user '{user}' — {d.get('comment_karma', 0)} comment karma.", detail=detail)
+    except (requests.RequestException, ValueError) as e:
+        return Result("Reddit profile", "Identity", "error", error=str(e))
+
+
+# ---------------------------------------------------------------------------
+# Source: Hacker News user (no key)
+# ---------------------------------------------------------------------------
+def src_hackernews(query, cfg):
+    user = _q(query, "username")
+    if not user:
+        return Result("Hacker News profile", "Identity", "not_found", "No username provided.")
+    try:
+        r = _get(f"https://hacker-news.firebaseio.com/v0/user/{user}.json")
+        if r.status_code != 200 or r.json() is None:
+            return Result("Hacker News profile", "Identity", "not_found", f"No HN user '{user}'.")
+        d = r.json()
+        import datetime as _dt
+        created = d.get("created")
+        detail = {
+            "karma": d.get("karma"),
+            "created": _dt.datetime.utcfromtimestamp(created).date().isoformat() if created else None,
+            "submissions": len(d.get("submitted", [])),
+            "about": d.get("about"),
+            "url": f"https://news.ycombinator.com/user?id={user}",
+        }
+        return Result("Hacker News profile", "Identity", "ok",
+                      f"HN user '{user}' — {d.get('karma', 0)} karma.", detail=detail)
+    except (requests.RequestException, ValueError) as e:
+        return Result("Hacker News profile", "Identity", "error", error=str(e))
+
+
+# ---------------------------------------------------------------------------
 # Source: CourtListener (no key required; COURTLISTENER_TOKEN raises limits)
 # ---------------------------------------------------------------------------
 def src_courtlistener(query, cfg):
@@ -383,8 +497,12 @@ def src_phone(query, cfg):
 SOURCES = [
     Source("username", "Username footprint", "Identity", ("username",), None, src_username),
     Source("github", "GitHub profile", "Identity", ("username",), None, src_github),
+    Source("reddit", "Reddit profile", "Identity", ("username",), None, src_reddit),
+    Source("hackernews", "Hacker News profile", "Identity", ("username",), None, src_hackernews),
     Source("gravatar", "Gravatar", "Identity", ("email",), None, src_gravatar),
     Source("domain", "Domain WHOIS/RDAP", "Infrastructure", ("domain",), None, src_domain),
+    Source("dns", "DNS records", "Infrastructure", ("domain",), None, src_dns),
+    Source("crtsh", "Subdomains (crt.sh)", "Infrastructure", ("domain",), None, src_crtsh),
     Source("courtlistener", "Court records (CourtListener)", "Legal", ("name",), None, src_courtlistener),
     Source("hibp", "Breach exposure (HIBP)", "Exposure", ("email",), "HIBP_API_KEY", src_hibp),
     Source("opencorporates", "Company affiliations (OpenCorporates)", "Business", ("name",), "OPENCORPORATES_API_KEY", src_opencorporates),

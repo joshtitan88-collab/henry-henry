@@ -833,6 +833,33 @@ def build_summary_prompt(query, results):
     return "\n".join(lines)
 
 
+def build_report_md(query, results, summary=None):
+    lines = ["# OSINT Report — H & H Investigation", ""]
+    lines.append(f"_Generated {datetime.datetime.now(datetime.timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}_")
+    q = ", ".join(f"{k}={v}" for k, v in query.items() if (v or "").strip())
+    lines.append(f"\n**Search subject:** {q}\n")
+    if summary:
+        lines += ["## Summary", "", summary, ""]
+    lines.append("## Findings")
+    for r in results:
+        lines.append(f"\n### {r.source}  ·  {r.status.upper()}  ·  {r.category}")
+        if r.summary:
+            lines.append(r.summary)
+        if r.error:
+            lines.append(f"_error: {r.error}_")
+        for k, v in (r.detail or {}).items():
+            if v:
+                if isinstance(v, list):
+                    v = ", ".join(str(x) for x in v)
+                lines.append(f"- **{k.replace('_', ' ').title()}:** {v}")
+        for it in (r.items or []):
+            lines.append("- " + "; ".join(f"{k}: {v}" for k, v in it.items() if v))
+    lines += ["", "---",
+              "_Derived from lawful open-source intelligence and public records. "
+              "Not a consumer report; not for FCRA-covered decisions._"]
+    return "\n".join(lines)
+
+
 def render_osint_result(r):
     color = OSINT_STATUS.get(r.status, "#5a6878")
     label = OSINT_LABEL.get(r.status, r.status.upper())
@@ -937,10 +964,19 @@ def page_search():
         st.markdown("#### Sources")
         for r in results:
             render_osint_result(r)
-        if st.button("Clear results"):
-            for k in ("osint_results", "osint_query", "osint_summary", "osint_summary_err"):
-                st.session_state.pop(k, None)
-            st.rerun()
+
+        report = build_report_md(q, results, st.session_state.get("osint_summary"))
+        subject_slug = re.sub(r"[^a-z0-9]+", "-", (shown or "report").lower())[:40].strip("-")
+        dl, clr = st.columns([1, 1])
+        with dl:
+            st.download_button("Download report (.md)", report,
+                               file_name=f"osint-{subject_slug or 'report'}.md",
+                               mime="text/markdown")
+        with clr:
+            if st.button("Clear results"):
+                for k in ("osint_results", "osint_query", "osint_summary", "osint_summary_err"):
+                    st.session_state.pop(k, None)
+                st.rerun()
 
     render_footer()
 
