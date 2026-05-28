@@ -50,6 +50,43 @@ services:
       - key: ANTHROPIC_API_KEY
         sync: false
 
+  # Scheduled monitoring: re-runs saved monitors and emails on change.
+  - type: cron
+    name: hh-monitor
+    runtime: python
+    schedule: "0 * * * *"  # hourly
+    buildCommand: pip install -r requirements-prod.txt
+    startCommand: python monitor.py
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.12.7
+      - key: DATABASE_URL
+        fromDatabase:
+          name: hh-intake-db
+          property: connectionString
+      - key: GITHUB_TOKEN
+        sync: false
+      - key: COURTLISTENER_TOKEN
+        sync: false
+      - key: HIBP_API_KEY
+        sync: false
+      - key: OPENCORPORATES_API_KEY
+        sync: false
+      - key: NUMVERIFY_API_KEY
+        sync: false
+      - key: SHODAN_API_KEY
+        sync: false
+      - key: SMTP_HOST
+        sync: false
+      - key: SMTP_PORT
+        sync: false
+      - key: SMTP_USERNAME
+        sync: false
+      - key: SMTP_PASSWORD
+        sync: false
+      - key: SMTP_FROM
+        sync: false
+
 databases:
   - name: hh-intake-db
     plan: starter

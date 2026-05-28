@@ -106,6 +106,20 @@ searches_t = Table(
     Column("n_ok", Integer),
 )
 
+# Saved searches that monitor.py re-runs on a schedule, alerting on change.
+monitors_t = Table(
+    "monitors", metadata,
+    Column("id", Integer, primary_key=True, autoincrement=True),
+    Column("created_at", DateTime(timezone=True)),
+    Column("label", String(200)),
+    Column("query", Text),          # JSON
+    Column("notify_email", String(255)),
+    Column("active", Boolean, default=True),
+    Column("last_run", DateTime(timezone=True)),
+    Column("last_hash", String(64)),
+    Column("last_summary", Text),   # JSON
+)
+
 
 @st.cache_resource
 def get_engine():
@@ -245,6 +259,56 @@ def source_stats(engine, limit=1000):
         s["answer_rate"] = round(100 * answered / s["total"]) if s["total"] else 0
         s["avg_latency_ms"] = round(s["latency_sum"] / s["latency_n"]) if s["latency_n"] else 0
     return stats
+
+
+# ---------------------------------------------------------------------------
+# Monitors — saved searches re-run on a schedule, alerting on change
+# ---------------------------------------------------------------------------
+def add_monitor(engine, label, query, notify_email):
+    q = {k: v for k, v in query.items() if (v or "").strip()}
+    with engine.begin() as conn:
+        conn.execute(monitors_t.insert().values(
+            created_at=datetime.datetime.now(datetime.timezone.utc),
+            label=label, query=json.dumps(q), notify_email=notify_email or "",
+            active=True, last_run=None, last_hash="", last_summary="",
+        ))
+
+
+def list_monitors(engine):
+    with engine.connect() as conn:
+        return conn.execute(select(monitors_t).order_by(monitors_t.c.id.desc())).mappings().all()
+
+
+def delete_monitor(engine, monitor_id):
+    with engine.begin() as conn:
+        conn.execute(monitors_t.delete().where(monitors_t.c.id == monitor_id))
+
+
+def set_monitor_active(engine, monitor_id, active):
+    with engine.begin() as conn:
+        conn.execute(monitors_t.update().where(monitors_t.c.id == monitor_id).values(active=active))
+
+
+def run_monitor(engine, monitor, cfg):
+    """Re-run one monitor's search (fresh), detect change vs. last fingerprint,
+    email on change, and persist the new state. Returns (changed, results)."""
+    query = json.loads(monitor["query"] or "{}")
+    results = osint_engine.run_search(query, cfg, use_cache=False)
+    fp = osint_engine.fingerprint(results)
+    changed = bool(monitor["last_hash"]) and fp != monitor["last_hash"]
+    now = datetime.datetime.now(datetime.timezone.utc)
+    summary = [{"source": r.source, "status": r.status, "items": len(r.items)} for r in results]
+    with engine.begin() as conn:
+        conn.execute(monitors_t.update().where(monitors_t.c.id == monitor["id"]).values(
+            last_run=now, last_hash=fp, last_summary=json.dumps(summary),
+        ))
+    if changed and monitor["notify_email"]:
+        q = ", ".join(f"{k}={v}" for k, v in query.items())
+        send_email(monitor["notify_email"],
+                   f"[H&H Monitor] Change detected — {monitor['label']}",
+                   f"The monitored search '{monitor['label']}' ({q}) changed.\n\n"
+                   + build_report_md(query, results))
+    return changed, results
 
 
 # ---------------------------------------------------------------------------
@@ -666,7 +730,8 @@ def page_admin(engine):
         st.session_state.admin_auth = False
         st.rerun()
 
-    tab_req, tab_analytics, tab_assistant = st.tabs(["Requests", "Search Analytics", "Assistant"])
+    tab_req, tab_monitors, tab_analytics, tab_assistant = st.tabs(
+        ["Requests", "Monitors", "Search Analytics", "Assistant"])
 
     with tab_req:
         counts = status_counts(engine)
@@ -714,6 +779,9 @@ def page_admin(engine):
                     st.success(f"Updated {r['ref_number']}.")
                     st.rerun()
 
+    with tab_monitors:
+        render_admin_monitors(engine)
+
     with tab_analytics:
         render_search_analytics(engine)
 
@@ -721,6 +789,63 @@ def page_admin(engine):
         render_admin_assistant(engine)
 
     render_footer()
+
+
+# ---------------------------------------------------------------------------
+# Admin: monitors (saved searches, re-run on a schedule)
+# ---------------------------------------------------------------------------
+def render_admin_monitors(engine):
+    st.caption("Saved searches re-run on a schedule by monitor.py (cron). "
+               "You get an email when the findings change.")
+    with st.form("add_monitor_form", clear_on_submit=True):
+        label = st.text_input("Monitor label", placeholder="e.g. Watch acme.com")
+        c1, c2 = st.columns(2)
+        with c1:
+            m_name = st.text_input("Full name", key="mon_name")
+            m_email = st.text_input("Email", key="mon_email")
+            m_username = st.text_input("Username", key="mon_username")
+        with c2:
+            m_phone = st.text_input("Phone", key="mon_phone")
+            m_domain = st.text_input("Domain", key="mon_domain")
+        notify = st.text_input("Notify email (on change)")
+        if st.form_submit_button("Add monitor", type="primary"):
+            query = {"name": m_name, "email": m_email, "username": m_username,
+                     "phone": m_phone, "domain": m_domain}
+            if not label.strip() or not any((v or "").strip() for v in query.values()):
+                st.error("A label and at least one search field are required.")
+            else:
+                add_monitor(engine, label.strip(), query, notify.strip())
+                st.success(f"Monitor '{label.strip()}' added.")
+                st.rerun()
+
+    monitors = list_monitors(engine)
+    if not monitors:
+        st.info("No monitors yet.")
+        return
+    for m in monitors:
+        q = json.loads(m["query"] or "{}")
+        qstr = ", ".join(f"{esc(k)}={esc(v)}" for k, v in q.items())
+        state = "active" if m["active"] else "paused"
+        last = str(m["last_run"])[:19] if m["last_run"] else "never run"
+        with st.expander(f"{m['label']} — {state} · last: {last}"):
+            st.markdown(f"**Query:** {qstr}")
+            st.markdown(f"**Notify:** {esc(m['notify_email'] or '—')}")
+            c1, c2, c3 = st.columns(3)
+            with c1:
+                if st.button("Run now", key=f"runmon_{m['id']}"):
+                    changed, _ = run_monitor(engine, m, build_osint_cfg())
+                    st.success("Change detected — alert sent." if changed
+                               else "Ran. No change since last run." if m["last_hash"]
+                               else "Baseline captured.")
+                    st.rerun()
+            with c2:
+                if st.button("Pause" if m["active"] else "Resume", key=f"togmon_{m['id']}"):
+                    set_monitor_active(engine, m["id"], not m["active"])
+                    st.rerun()
+            with c3:
+                if st.button("Delete", key=f"delmon_{m['id']}"):
+                    delete_monitor(engine, m["id"])
+                    st.rerun()
 
 
 # ---------------------------------------------------------------------------

@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import concurrent.futures
 import hashlib
+import json
 import re
 import time
 from dataclasses import dataclass, field
@@ -63,6 +64,9 @@ class Source:
     key: Optional[str]  # config var required to enable, or None
     run: Callable  # (query: dict, cfg: dict) -> Result
     note: str = ""
+    # If True, this source's findings (items) are stable enough that a change
+    # should trip a monitor. False sources contribute only existence (status).
+    track_items: bool = False
 
 
 def _q(query, field_name):
@@ -586,12 +590,12 @@ SOURCES = [
     Source("email_mx", "Email deliverability", "Contact", ("email",), None, src_email_mx),
     Source("domain", "Domain WHOIS/RDAP", "Infrastructure", ("domain",), None, src_domain),
     Source("dns", "DNS records", "Infrastructure", ("domain",), None, src_dns),
-    Source("crtsh", "Subdomains (crt.sh)", "Infrastructure", ("domain",), None, src_crtsh),
+    Source("crtsh", "Subdomains (crt.sh)", "Infrastructure", ("domain",), None, src_crtsh, track_items=True),
     Source("wayback", "Wayback Machine", "Infrastructure", ("domain",), None, src_wayback),
     Source("shodan", "Shodan host", "Infrastructure", ("domain",), "SHODAN_API_KEY", src_shodan),
-    Source("courtlistener", "Court records (CourtListener)", "Legal", ("name",), None, src_courtlistener),
-    Source("hibp", "Breach exposure (HIBP)", "Exposure", ("email",), "HIBP_API_KEY", src_hibp),
-    Source("opencorporates", "Company affiliations (OpenCorporates)", "Business", ("name",), "OPENCORPORATES_API_KEY", src_opencorporates),
+    Source("courtlistener", "Court records (CourtListener)", "Legal", ("name",), None, src_courtlistener, track_items=True),
+    Source("hibp", "Breach exposure (HIBP)", "Exposure", ("email",), "HIBP_API_KEY", src_hibp, track_items=True),
+    Source("opencorporates", "Company affiliations (OpenCorporates)", "Business", ("name",), "OPENCORPORATES_API_KEY", src_opencorporates, track_items=True),
     Source("phone", "Phone intel (numverify)", "Contact", ("phone",), "NUMVERIFY_API_KEY", src_phone),
 ]
 
@@ -603,6 +607,50 @@ def applicable_sources(query):
         if any(_q(query, f) for f in s.inputs):
             out.append(s)
     return out
+
+
+def required_keys():
+    """Config var names used by key-gated sources."""
+    return sorted({s.key for s in SOURCES if s.key})
+
+
+# Detail fields that legitimately change every run and must not trip a monitor.
+_VOLATILE_DETAIL = {"snapshot", "url", "last_changed", "expires"}
+
+
+def _norm_val(v):
+    """Order-insensitive normalization so list/CSV ordering doesn't trip a monitor."""
+    if isinstance(v, (list, tuple)):
+        return sorted(str(x) for x in v)
+    s = str(v)
+    if "," in s:
+        return sorted(p.strip() for p in s.split(","))
+    return s
+
+
+def fingerprint(results):
+    """Stable hash of the *meaningful findings* in a result set, for monitors.
+
+    Rules that keep alerts signal-not-noise:
+    - Only `ok`/`not_found` sources count, so a flaky source or missing key
+      (`error`/`no_key`) never fires a false alert.
+    - Every counted source contributes its existence (status).
+    - Only `track_items` sources (subdomains, court records, breaches, company
+      officers) contribute their findings (items) — volatile sources like DNS
+      A-records and username presence-checks contribute existence only."""
+    track = {s.label: s.track_items for s in SOURCES}
+    norm = []
+    for r in sorted(results, key=lambda r: r.source):
+        if r.status not in ("ok", "not_found"):
+            continue
+        entry = {"source": r.source, "status": r.status}
+        if track.get(r.source):
+            entry["items"] = sorted(
+                json.dumps({k: _norm_val(v) for k, v in sorted(it.items())}, sort_keys=True)
+                for it in (r.items or [])
+            )
+        norm.append(entry)
+    return hashlib.sha256(json.dumps(norm, sort_keys=True).encode()).hexdigest()
 
 
 CACHE_TTL = 600  # seconds
