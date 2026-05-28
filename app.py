@@ -81,12 +81,12 @@ PLANS = [
         "GitHub · Reddit · Hacker News · Gravatar",
         "Email deliverability + domain WHOIS / DNS / Wayback",
     ], False),
-    ("Pro", "Public records & infrastructure", "$49 / mo", [
+    ("Pro", "Public records & infrastructure", "$34.99 / mo", [
         "Everything in Recon, plus:",
         "Court records (CourtListener) · company officers",
         "Subdomains (crt.sh) · phone intel · host & port intel (Shodan)",
     ], True),
-    ("Deep", "Breach & dark-web exposure", "$149 / mo", [
+    ("Deep", "Breach & dark-web exposure", "$59.99 / mo", [
         "Everything in Pro, plus:",
         "Breach / dark-web exposure lookup (HaveIBeenPwned)",
         "Scheduled monitoring with change alerts",
