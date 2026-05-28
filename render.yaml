@@ -26,6 +26,19 @@ services:
         sync: false
       - key: SMTP_FROM
         sync: false
+      # OSINT data-source credentials (optional — search works without them;
+      # each one activates / strengthens its source). Set in the Render
+      # dashboard; sync:false keeps them out of the repo.
+      - key: GITHUB_TOKEN
+        sync: false
+      - key: COURTLISTENER_TOKEN
+        sync: false
+      - key: HIBP_API_KEY
+        sync: false
+      - key: OPENCORPORATES_API_KEY
+        sync: false
+      - key: NUMVERIFY_API_KEY
+        sync: false
 
 databases:
   - name: hh-intake-db
