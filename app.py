@@ -57,6 +57,131 @@ STATUS_COLORS = {
 
 EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 
+# Residents of these states are blocked from the self-service tool. California's
+# investigative-services and consumer-data rules are the strictest in the U.S.,
+# so CA residents are excluded pending counsel review. Edit this set to adjust.
+RESTRICTED_STATES = {"California"}
+
+US_STATES = [
+    "Alabama", "Alaska", "Arizona", "Arkansas", "California", "Colorado",
+    "Connecticut", "Delaware", "District of Columbia", "Florida", "Georgia",
+    "Hawaii", "Idaho", "Illinois", "Indiana", "Iowa", "Kansas", "Kentucky",
+    "Louisiana", "Maine", "Maryland", "Massachusetts", "Michigan", "Minnesota",
+    "Mississippi", "Missouri", "Montana", "Nebraska", "Nevada", "New Hampshire",
+    "New Jersey", "New Mexico", "New York", "North Carolina", "North Dakota",
+    "Ohio", "Oklahoma", "Oregon", "Pennsylvania", "Rhode Island",
+    "South Carolina", "South Dakota", "Tennessee", "Texas", "Utah", "Vermont",
+    "Virginia", "Washington", "West Virginia", "Wisconsin", "Wyoming",
+    "Outside the United States",
+]
+
+ACCEPTABLE_USE_SUMMARY = """
+**You run the searches — you own how the results are used.** H&H provides the
+tools; it does not conduct investigations for you and is not a consumer
+reporting agency.
+
+**Permitted:** lawful research you are authorized to perform — locating your own
+information, due diligence, journalism, fraud prevention, reconnecting with
+people, and similar legitimate purposes.
+
+**Never permitted:**
+- Employment, credit, insurance, housing/tenant, or any other **FCRA-covered**
+  eligibility decision. Results are **not** a consumer report.
+- Stalking, harassment, intimidation, threats, or causing harm to any person.
+- Unlawful discrimination, or any use that violates federal, state, or local law.
+- Re-selling the data or misrepresenting it as a background or credit report.
+"""
+
+TERMS_MD = """
+# Terms of Use & Acceptable Use Policy
+
+_Last updated: 2026-05-28_
+
+These Terms govern your use of the H&H Investigation self-service search tool
+(the "Tool"). By accessing or using the Tool you agree to these Terms. If you do
+not agree, do not use the Tool.
+
+## 1. Self-service nature of the Tool
+
+The Tool provides **self-service** access to publicly available, open-source,
+and public-record information. **You** decide what to search and **you** run each
+search. H&H Investigation ("H&H") supplies software that automates lookups you
+could perform yourself. H&H does **not** perform investigations on your behalf,
+does **not** act as a licensed private investigator for you, and forms **no**
+investigator-client or attorney-client relationship with you.
+
+## 2. Not a consumer reporting agency
+
+H&H is **not** a consumer reporting agency, and the information returned by the
+Tool is **not** a "consumer report" or "investigative consumer report" as those
+terms are defined in the federal Fair Credit Reporting Act (FCRA), 15 U.S.C.
+§ 1681 et seq. **You may not use the Tool or its results, in whole or in part:**
+
+- to make decisions about **employment** (hiring, retention, promotion, reassignment);
+- to evaluate eligibility for **credit** or insurance;
+- to evaluate **housing or tenancy** applications;
+- to determine eligibility for a government **license or benefit**; or
+- for any other purpose covered by the FCRA or any comparable state law.
+
+If you need information for any of these purposes, obtain a compliant consumer
+report from a licensed consumer reporting agency.
+
+## 3. Prohibited uses
+
+You agree that you will **not** use the Tool to:
+
+- stalk, harass, intimidate, threaten, dox, or otherwise harm any person;
+- violate the Driver's Privacy Protection Act (DPPA), the Gramm-Leach-Bliley Act
+  (GLBA), or any other privacy, anti-stalking, computer-fraud, or data-protection law;
+- engage in unlawful discrimination;
+- impersonate any person or misrepresent the source or nature of the data; or
+- resell, sublicense, or redistribute the data or present it as a background,
+  credit, or consumer report.
+
+## 4. Lawful purpose and your responsibility
+
+You represent that for **every** search you run you have a lawful, legitimate
+purpose and are authorized to seek the information. **You are solely responsible**
+for your searches and for how you use the results. You agree to indemnify and
+hold harmless H&H and its operators from any claim arising out of your use of the
+Tool or your violation of these Terms or any law.
+
+## 5. Geographic eligibility
+
+The Tool is offered only to individuals located in, and resident of, eligible
+U.S. jurisdictions. It is **not** available to residents of California or to
+users outside the United States. You must accurately state your state of
+residence; misrepresenting it is a breach of these Terms.
+
+## 6. Data accuracy; no warranty
+
+Information is aggregated from third-party public and open sources. H&H does not
+originate, verify, or guarantee the accuracy, completeness, or timeliness of any
+result. The Tool is provided **"as is"** and **"as available,"** without
+warranties of any kind, express or implied. Results may be incomplete, outdated,
+or incorrect, and must be independently verified before you rely on them.
+
+## 7. Limitation of liability
+
+To the maximum extent permitted by law, H&H and its operators will not be liable
+for any indirect, incidental, special, consequential, or punitive damages, or for
+any loss arising from your use of, or inability to use, the Tool or its results.
+
+## 8. Eligibility and changes
+
+You must be at least 18 years old to use the Tool. H&H may modify these Terms or
+suspend the Tool at any time. Continued use after a change constitutes acceptance.
+
+## 9. Contact
+
+Questions about these Terms: joshua@hhinvestigations.com
+
+---
+
+_This document is a starting template and has not been reviewed by an attorney.
+Have qualified counsel review and adapt it before relying on it in production._
+"""
+
 
 def esc(value):
     """HTML-escape any value before it enters an unsafe_allow_html block."""
@@ -479,6 +604,80 @@ def mask_name(name):
 
 
 # ---------------------------------------------------------------------------
+# Pre-entry consent gate (CA-resident block + acceptable-use attestations)
+# ---------------------------------------------------------------------------
+def require_consent():
+    """Gate the self-service tools. Returns True only after the user has, this
+    session, selected an eligible state of residence and accepted every
+    acceptable-use attestation. Otherwise renders the gate and returns False."""
+    if st.session_state.get("consent_ok"):
+        return True
+
+    st.markdown('<div class="section-label">Before you begin</div>', unsafe_allow_html=True)
+    st.markdown('<div class="section-title">Terms of <em>Use</em></div>', unsafe_allow_html=True)
+    st.markdown(
+        '<p style="max-width:680px;font-size:14px;color:#c2cdd9;line-height:1.8;">'
+        'H&amp;H provides <strong style="color:#eaeef4;">self-service</strong> access to '
+        'public-record and open-source search tools. <strong style="color:#eaeef4;">You</strong> '
+        'run the searches and are solely responsible for how you use the results. '
+        'H&amp;H is not a consumer reporting agency and does not run investigations on your behalf.</p>',
+        unsafe_allow_html=True,
+    )
+
+    state = st.selectbox("Your state of residence", ["— Select —"] + US_STATES,
+                         key="consent_state_sel")
+
+    if state in RESTRICTED_STATES or state == "Outside the United States":
+        where = "your location" if state == "Outside the United States" else state
+        st.error(
+            f"This self-service tool is not available to residents of {where}. "
+            "Access is blocked based on the location you selected."
+        )
+        st.caption("If you believe this is in error, contact joshua@hhinvestigations.com.")
+        return False
+
+    st.markdown("**You must confirm all of the following to proceed:**")
+    c_age = st.checkbox("I am at least 18 years old.", key="consent_age")
+    c_lawful = st.checkbox(
+        "I have a lawful, legitimate purpose for every search I run, and I am "
+        "authorized to seek this information.", key="consent_lawful")
+    c_fcra = st.checkbox(
+        "I understand the results are NOT a consumer report, and I will not use "
+        "them for employment, credit, insurance, housing/tenant screening, or "
+        "any other FCRA-covered eligibility decision.", key="consent_fcra")
+    c_noharm = st.checkbox(
+        "I will not use this tool to stalk, harass, intimidate, or harm any "
+        "person, or for any purpose prohibited by law.", key="consent_noharm")
+    c_terms = st.checkbox(
+        'I have read and agree to the Terms of Use & Acceptable Use Policy '
+        '(see "Terms" in the sidebar).', key="consent_terms")
+
+    if st.button("Enter the tool", type="primary", key="consent_enter"):
+        if state == "— Select —":
+            st.error("Please select your state of residence.")
+        elif not all([c_age, c_lawful, c_fcra, c_noharm, c_terms]):
+            st.error("You must check every box above to use the tool.")
+        else:
+            st.session_state.consent_ok = True
+            st.session_state.consent_state = state
+            st.rerun()
+
+    with st.expander("Acceptable Use — summary"):
+        st.markdown(ACCEPTABLE_USE_SUMMARY)
+
+    return False
+
+
+# ---------------------------------------------------------------------------
+# Page: Terms of Use
+# ---------------------------------------------------------------------------
+def page_terms():
+    render_brand_bar()
+    st.markdown(TERMS_MD)
+    render_footer()
+
+
+# ---------------------------------------------------------------------------
 # Page: Home
 # ---------------------------------------------------------------------------
 def page_home():
@@ -540,6 +739,9 @@ def page_home():
 # ---------------------------------------------------------------------------
 def page_new_request(engine):
     render_brand_bar()
+    if not require_consent():
+        render_footer()
+        return
     st.markdown('<div class="section-label">Client Intake</div>', unsafe_allow_html=True)
     st.markdown('<div class="section-title">Request <em>a Dossier</em></div>', unsafe_allow_html=True)
 
@@ -1086,6 +1288,9 @@ def render_osint_result(r):
 
 def page_search():
     render_brand_bar()
+    if not require_consent():
+        render_footer()
+        return
     st.markdown('<div class="section-label">OSINT Search</div>', unsafe_allow_html=True)
     st.markdown('<div class="section-title">Public-Record <em>Lookup</em></div>', unsafe_allow_html=True)
     st.caption(
@@ -1192,7 +1397,7 @@ st.sidebar.markdown(
     unsafe_allow_html=True,
 )
 
-pages = ["Home", "Search", "New Request", "My Requests", "Admin"]
+pages = ["Home", "Search", "New Request", "My Requests", "Terms", "Admin"]
 default_idx = pages.index(st.session_state.get("nav", "Home"))
 page = st.sidebar.radio("Navigation", pages, index=default_idx, label_visibility="collapsed")
 if st.session_state.get("nav") and st.session_state.nav != page:
@@ -1206,5 +1411,7 @@ elif page == "New Request":
     page_new_request(engine)
 elif page == "My Requests":
     page_my_requests(engine)
+elif page == "Terms":
+    page_terms()
 elif page == "Admin":
     page_admin(engine)
