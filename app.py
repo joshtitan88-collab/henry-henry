@@ -847,7 +847,7 @@ def render_admin_assistant(engine):
 # Page: OSINT Search
 # ---------------------------------------------------------------------------
 OSINT_KEYS = ["HIBP_API_KEY", "OPENCORPORATES_API_KEY", "NUMVERIFY_API_KEY",
-              "GITHUB_TOKEN", "COURTLISTENER_TOKEN"]
+              "GITHUB_TOKEN", "COURTLISTENER_TOKEN", "SHODAN_API_KEY"]
 
 OSINT_STATUS = {"ok": "#2ea043", "not_found": "#5a6878", "no_key": "#c9a444", "error": "#c23b22"}
 OSINT_LABEL = {"ok": "FOUND", "not_found": "NONE", "no_key": "NEEDS KEY", "error": "ERROR"}

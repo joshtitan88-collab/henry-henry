@@ -39,6 +39,8 @@ services:
         sync: false
       - key: NUMVERIFY_API_KEY
         sync: false
+      - key: SHODAN_API_KEY
+        sync: false
       # AI summary engine (optional, cheapest-first). Ollama is local-only so
       # it is not set here; Gemini/Claude keys can be added if wanted.
       - key: GEMINI_API_KEY

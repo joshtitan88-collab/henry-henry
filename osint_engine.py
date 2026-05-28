@@ -492,6 +492,89 @@ def src_phone(query, cfg):
 
 
 # ---------------------------------------------------------------------------
+# Source: email deliverability / MX (no key)
+# ---------------------------------------------------------------------------
+def src_email_mx(query, cfg):
+    email = _q(query, "email")
+    if not email or "@" not in email:
+        return Result("Email deliverability", "Contact", "not_found", "No valid email provided.")
+    domain = email.rsplit("@", 1)[-1].lower()
+    try:
+        r = _get("https://dns.google/resolve", params={"name": domain, "type": "MX"})
+        answers = r.json().get("Answer", []) if r.status_code == 200 else []
+        mx = [a.get("data") for a in answers if a.get("data")]
+    except (requests.RequestException, ValueError) as e:
+        return Result("Email deliverability", "Contact", "error", error=str(e))
+    if not mx:
+        return Result("Email deliverability", "Contact", "not_found",
+                      f"{domain} has no MX records — it cannot receive mail.")
+    return Result("Email deliverability", "Contact", "ok",
+                  f"{domain} accepts mail ({len(mx)} MX host(s)).",
+                  detail={"domain": domain, "accepts_mail": True, "mx_hosts": [m.strip() for m in mx[:5]]})
+
+
+# ---------------------------------------------------------------------------
+# Source: Wayback Machine (no key)
+# ---------------------------------------------------------------------------
+def src_wayback(query, cfg):
+    domain = _q(query, "domain").lower().replace("https://", "").replace("http://", "").strip("/")
+    if not domain:
+        return Result("Wayback Machine", "Infrastructure", "not_found", "No domain provided.")
+    try:
+        r = _get("https://archive.org/wayback/available", params={"url": domain})
+        snap = (r.json().get("archived_snapshots") or {}).get("closest") if r.status_code == 200 else None
+    except (requests.RequestException, ValueError) as e:
+        return Result("Wayback Machine", "Infrastructure", "error", error=str(e))
+    if not snap:
+        return Result("Wayback Machine", "Infrastructure", "not_found",
+                      f"No Wayback snapshots for {domain}.")
+    ts = snap.get("timestamp", "")
+    pretty = f"{ts[0:4]}-{ts[4:6]}-{ts[6:8]}" if len(ts) >= 8 else ts
+    return Result("Wayback Machine", "Infrastructure", "ok",
+                  f"{domain} archived — closest snapshot {pretty}.",
+                  detail={"snapshot": pretty, "url": snap.get("url")})
+
+
+# ---------------------------------------------------------------------------
+# Source: Shodan host (needs SHODAN_API_KEY) — resolves domain -> IP -> host info
+# ---------------------------------------------------------------------------
+def src_shodan(query, cfg):
+    domain = _q(query, "domain").lower().replace("https://", "").replace("http://", "").strip("/")
+    if not domain:
+        return Result("Shodan host", "Infrastructure", "not_found", "No domain provided.")
+    key = cfg.get("SHODAN_API_KEY")
+    if not key:
+        return Result("Shodan host", "Infrastructure", "no_key",
+                      "Set SHODAN_API_KEY to enable host/port intelligence.")
+    try:
+        rd = _get("https://dns.google/resolve", params={"name": domain, "type": "A"})
+        ips = [a.get("data") for a in rd.json().get("Answer", []) if a.get("type") == 1]
+        if not ips:
+            return Result("Shodan host", "Infrastructure", "not_found", f"Could not resolve {domain}.")
+        ip = ips[0]
+        r = _get(f"https://api.shodan.io/shodan/host/{ip}", params={"key": key})
+        if r.status_code == 404:
+            return Result("Shodan host", "Infrastructure", "not_found", f"No Shodan data for {ip}.")
+        if r.status_code == 401:
+            return Result("Shodan host", "Infrastructure", "error", error="Invalid SHODAN_API_KEY.")
+        if r.status_code != 200:
+            return Result("Shodan host", "Infrastructure", "error", error=f"Shodan returned {r.status_code}")
+        d = r.json()
+        detail = {
+            "ip": ip,
+            "org": d.get("org"),
+            "os": d.get("os"),
+            "ports": d.get("ports"),
+            "hostnames": d.get("hostnames"),
+        }
+        return Result("Shodan host", "Infrastructure", "ok",
+                      f"{ip} — {len(d.get('ports', []))} open port(s)"
+                      + (f", {d.get('org')}" if d.get("org") else "") + ".", detail=detail)
+    except (requests.RequestException, ValueError) as e:
+        return Result("Shodan host", "Infrastructure", "error", error=str(e))
+
+
+# ---------------------------------------------------------------------------
 # Registry
 # ---------------------------------------------------------------------------
 SOURCES = [
@@ -500,9 +583,12 @@ SOURCES = [
     Source("reddit", "Reddit profile", "Identity", ("username",), None, src_reddit),
     Source("hackernews", "Hacker News profile", "Identity", ("username",), None, src_hackernews),
     Source("gravatar", "Gravatar", "Identity", ("email",), None, src_gravatar),
+    Source("email_mx", "Email deliverability", "Contact", ("email",), None, src_email_mx),
     Source("domain", "Domain WHOIS/RDAP", "Infrastructure", ("domain",), None, src_domain),
     Source("dns", "DNS records", "Infrastructure", ("domain",), None, src_dns),
     Source("crtsh", "Subdomains (crt.sh)", "Infrastructure", ("domain",), None, src_crtsh),
+    Source("wayback", "Wayback Machine", "Infrastructure", ("domain",), None, src_wayback),
+    Source("shodan", "Shodan host", "Infrastructure", ("domain",), "SHODAN_API_KEY", src_shodan),
     Source("courtlistener", "Court records (CourtListener)", "Legal", ("name",), None, src_courtlistener),
     Source("hibp", "Breach exposure (HIBP)", "Exposure", ("email",), "HIBP_API_KEY", src_hibp),
     Source("opencorporates", "Company affiliations (OpenCorporates)", "Business", ("name",), "OPENCORPORATES_API_KEY", src_opencorporates),
@@ -519,12 +605,35 @@ def applicable_sources(query):
     return out
 
 
-def run_search(query, cfg, source_ids=None):
-    """Run all applicable sources in parallel and return a list[Result]."""
+CACHE_TTL = 600  # seconds
+_CACHE = {}  # key -> (timestamp, results)
+
+
+def _cache_key(query, sources, cfg):
+    # Key on the normalized query plus which sources ran and whether each had
+    # its key — so adding a key (or a different query) misses the stale entry.
+    q = "|".join(f"{k}={_q(query, k)}" for k in sorted(query))
+    s = ",".join(f"{src.id}:{int(bool(cfg.get(src.key)))}" for src in sources)
+    return q + "||" + s
+
+
+def run_search(query, cfg, source_ids=None, use_cache=True):
+    """Run all applicable sources in parallel and return a list[Result].
+
+    Results are cached in-process for CACHE_TTL seconds to cut cost/latency on
+    repeat queries; pass use_cache=False for always-fresh runs (e.g. monitors).
+    """
     cfg = cfg or {}
     sources = applicable_sources(query)
     if source_ids is not None:
         sources = [s for s in sources if s.id in source_ids]
+
+    key = _cache_key(query, sources, cfg)
+    if use_cache:
+        hit = _CACHE.get(key)
+        if hit and (time.monotonic() - hit[0]) < CACHE_TTL:
+            return hit[1]
+
     def _timed(s):
         t0 = time.monotonic()
         try:
@@ -540,4 +649,7 @@ def run_search(query, cfg, source_ids=None):
             results.append(r)
     order = {s.label: i for i, s in enumerate(SOURCES)}
     results.sort(key=lambda r: order.get(r.source, 99))
+
+    if use_cache:
+        _CACHE[key] = (time.monotonic(), results)
     return results
