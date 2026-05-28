@@ -46,6 +46,40 @@ TIERS = [
     "Spec Audit — $3,500+",
 ]
 
+# Search-depth ladder — the self-service subscription model. Each tier is a
+# superset of the previous one; the deepest tier reaches breach / dark-web
+# exposure data. Source ids map to osint_engine.SOURCES. To change which
+# sources a plan includes, edit the lists here.
+DEPTH_RECON = ["username", "github", "reddit", "hackernews", "gravatar",
+               "email_mx", "domain", "dns", "wayback"]
+DEPTH_PRO = DEPTH_RECON + ["crtsh", "courtlistener", "opencorporates", "phone", "shodan"]
+DEPTH_DEEP = DEPTH_PRO + ["hibp"]
+
+DEPTHS = {
+    "Recon — surface web": DEPTH_RECON,
+    "Pro — public records & infrastructure": DEPTH_PRO,
+    "Deep — adds breach & dark-web exposure": DEPTH_DEEP,
+}
+
+# Public-facing plan cards (Home). Prices are placeholders — set your own.
+PLANS = [
+    ("Recon", "Surface web", "Free", [
+        "Social-handle footprint across 12 sites",
+        "GitHub · Reddit · Hacker News · Gravatar",
+        "Email deliverability + domain WHOIS / DNS / Wayback",
+    ], False),
+    ("Pro", "Public records & infrastructure", "$49 / mo", [
+        "Everything in Recon, plus:",
+        "Court records (CourtListener) · company officers",
+        "Subdomains (crt.sh) · phone intel · host & port intel (Shodan)",
+    ], True),
+    ("Deep", "Breach & dark-web exposure", "$149 / mo", [
+        "Everything in Pro, plus:",
+        "Breach / dark-web exposure lookup (HaveIBeenPwned)",
+        "Scheduled monitoring with change alerts",
+    ], False),
+]
+
 STATUS_ORDER = ["Submitted", "Engagement Sent", "In Progress", "Delivered"]
 
 STATUS_COLORS = {
@@ -682,54 +716,51 @@ def page_terms():
 # ---------------------------------------------------------------------------
 def page_home():
     render_brand_bar()
-    st.markdown('<div class="section-label">Georgia-based · Nationwide remote delivery</div>', unsafe_allow_html=True)
-    st.markdown('<div class="section-title">Investigative <em>Intelligence</em> on Demand</div>', unsafe_allow_html=True)
+    n_sources = len(osint_engine.SOURCES)
+    st.markdown('<div class="section-label">Self-service · Open-source intelligence</div>', unsafe_allow_html=True)
+    st.markdown('<div class="section-title">Run Your Own <em>Intelligence</em> Search</div>', unsafe_allow_html=True)
     st.markdown(
         """
         <p style="max-width:640px; font-size:15px; color:#c2cdd9; line-height:1.8; margin-bottom:8px;">
-        Give us a name and one anchor data point — phone, email, address, DOB, or employer.
-        Within <strong style="color:#eaeef4;">48 hours</strong> you have a sealed PDF dossier
-        cross-referenced across independent public-record sources.
+        Enter a name, email, username, phone, or domain. The tool fans out across dozens of
+        public-record and open-source signals in parallel and hands you a cross-referenced
+        report in <strong style="color:#eaeef4;">seconds</strong> — you run the search, the
+        results are yours. This is a self-service research tool, not a background-check service.
         </p>
         """,
         unsafe_allow_html=True,
     )
     st.markdown(
-        """
+        f"""
         <div class="metric-row">
-            <div class="metric-card"><div class="metric-num">49+</div><div class="metric-label">Public-record sources</div></div>
-            <div class="metric-card"><div class="metric-num">48h</div><div class="metric-label">Standard delivery</div></div>
+            <div class="metric-card"><div class="metric-num">{n_sources}</div><div class="metric-label">Live data sources</div></div>
+            <div class="metric-card"><div class="metric-num">Seconds</div><div class="metric-label">Parallel lookups</div></div>
             <div class="metric-card"><div class="metric-num">100%</div><div class="metric-label">Open-source · lawful</div></div>
-            <div class="metric-card"><div class="metric-num">$295</div><div class="metric-label">Starting price</div></div>
+            <div class="metric-card"><div class="metric-num">You</div><div class="metric-label">Run the search</div></div>
         </div>
         """,
         unsafe_allow_html=True,
     )
 
-    st.markdown('<div class="section-label">Pricing</div>', unsafe_allow_html=True)
-    st.markdown('<div class="section-title">Intelligence <em>Tiers</em></div>', unsafe_allow_html=True)
-    tiers = [
-        ("Discovery", "Single subject · Identity", "$295", "48 hours", "Who is this person? Where are they now?", False),
-        ("Asset & Affiliation", "Finances · Business ties", "$595", "72 hours", "What do they own? Where's the money?", False),
-        ("Family Law Standard", "Court-ready documentation", "$895", "5 business days", "Can we use this in court?", True),
-        ("Family Law Premium", "Two subjects · Comparative", "$1,495", "7 business days", "Two subjects — comparative analysis", False),
-        ("Monthly Retainer", "4x FL Standard · Priority queue", "$1,495/mo", "24h priority", "4 FL Standard dossiers/month, 3-month minimum", False),
-        ("Spec Audit", "Multi-subject · Expert-witness ready", "$3,500+", "10-14 days", "Complex multi-subject engagements, custom scope", False),
-    ]
+    st.markdown('<div class="section-label">Plans</div>', unsafe_allow_html=True)
+    st.markdown('<div class="section-title">The Deeper You Go, <em>The More You See</em></div>', unsafe_allow_html=True)
     html_out = '<div class="tier-grid">'
-    for name, tag, price, turn, scope, featured in tiers:
+    for name, tag, price, features, featured in PLANS:
         cls = "tier-card featured" if featured else "tier-card"
+        feats = "".join(f'<div class="tier-scope">• {esc(f)}</div>' for f in features)
         html_out += (
             f'<div class="{cls}"><div class="tier-name">{esc(name)}</div>'
             f'<div class="tier-tag">{esc(tag)}</div><div class="tier-price">{esc(price)}</div>'
-            f'<div class="tier-scope">{esc(scope)}</div><div class="tier-turn">{esc(turn)}</div></div>'
+            f'{feats}</div>'
         )
     html_out += "</div>"
     st.markdown(html_out, unsafe_allow_html=True)
+    st.caption("Prices shown are placeholders pending checkout setup. Results are not a "
+               "consumer report and may not be used for FCRA-covered decisions.")
 
     st.markdown("")
-    if st.button("Start a New Request", type="primary"):
-        st.session_state.nav = "New Request"
+    if st.button("Start Searching", type="primary"):
+        st.session_state.nav = "Search"
         st.rerun()
     render_footer()
 
@@ -1312,6 +1343,10 @@ def page_search():
         with c2:
             phone = st.text_input("Phone")
             domain = st.text_input("Domain", placeholder="example.com")
+        depth_names = list(DEPTHS.keys())
+        depth = st.selectbox("Search depth", depth_names, index=len(depth_names) - 1,
+                             help="Higher tiers run more (and deeper) sources. "
+                                  "The deepest tier reaches breach / dark-web exposure data.")
         run = st.form_submit_button("Run Search", type="primary")
 
     if run:
@@ -1320,7 +1355,7 @@ def page_search():
             st.error("Enter at least one identifier to search.")
         else:
             with st.spinner("Querying sources…"):
-                results = osint_engine.run_search(query, osint_cfg)
+                results = osint_engine.run_search(query, osint_cfg, source_ids=DEPTHS[depth])
                 log_search(engine, query, results)
                 st.session_state.osint_results = results
                 st.session_state.osint_query = query
