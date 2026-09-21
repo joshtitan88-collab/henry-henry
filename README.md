@@ -5,7 +5,7 @@ colorFrom: indigo
 colorTo: yellow
 sdk: static
 pinned: false
-license: mit
+license: proprietary
 ---
 
 # Henry & Henry — Brand Sandbox
@@ -53,4 +53,4 @@ A static Space with the visual identity for **Henry & Henry, Investigative Intel
 
 ## License
 
-MIT for the code. The wordmark and brand expression belong to Henry & Henry.
+All rights reserved. See LICENSE. The wordmark and brand expression belong to Henry & Henry.
